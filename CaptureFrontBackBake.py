@@ -1,0 +1,564 @@
+"""Capture Front/Back And Bake - Marmoset Toolbag 5 plugin.
+
+Substance-Painter-style projection bake: capture the CURRENT camera view of the
+visible scene (front), rotate the visible objects 180 degrees about world Y like a
+turntable and capture again (back), then project both captures onto the meshes' UVs
+and write one PNG per material. Overlapping/occluded areas and grazing side faces
+are left transparent (masked).
+
+INSTALL
+    Copy this file AND the ``projbake/`` folder next to it into your Toolbag
+    plugins directory, e.g. on Windows:
+        C:\\Users\\<you>\\AppData\\Local\\Marmoset Toolbag 5\\plugins\\CaptureFrontBackBake\\
+    (both ``CaptureFrontBackBake.py`` and ``projbake/`` in the same folder), then
+    Edit > Plugins > Refresh and run "Capture Front Back Bake".
+
+The heavy lifting lives in the dependency-free ``projbake`` package, which is unit
+tested outside Marmoset. This file only talks to ``mset``. If the projection looks
+mirrored/rotated in Marmoset, the one knob to try first is ``EULER_ORDER`` below
+(see docs/marmoset-api-notes.md).
+"""
+
+import os
+import sys
+import traceback
+
+import mset
+
+# --- make the bundled projbake package importable -------------------------
+def _plugin_dir():
+    try:
+        p = mset.getPluginPath()
+        if p:
+            return os.path.dirname(os.path.abspath(p))
+    except Exception:
+        pass
+    try:
+        return os.path.dirname(os.path.abspath(__file__))
+    except Exception:
+        return os.getcwd()
+
+_HERE = _plugin_dir()
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+
+from projbake import linalg as la          # noqa: E402
+from projbake import pngio                 # noqa: E402
+from projbake.image import ImageRGBA       # noqa: E402
+from projbake.mesh import SceneMesh, Submesh, group_by_material  # noqa: E402
+from projbake import bake                  # noqa: E402
+
+# ===========================================================================
+# Configuration
+# ===========================================================================
+# The single riskiest assumption: how Marmoset composes TransformObject.rotation.
+# YXZ keeps the 180-degree turntable exact (ry += 180). Change here if projection
+# is wrong after in-app testing.
+EULER_ORDER = "YXZ"
+
+TEXTURE_SIZES = ["512", "1024", "2048", "4096"]
+DEFAULT_SIZE = "2048"
+DEFAULT_SIDE_MASK_ANGLE = 75.0
+
+
+def _log(msg):
+    try:
+        mset.log("[CaptureFrontBackBake] " + str(msg) + "\n")
+    except Exception:
+        print(msg)
+
+
+def _err(msg):
+    try:
+        mset.err("[CaptureFrontBackBake] " + str(msg) + "\n")
+    except Exception:
+        print("ERROR:", msg)
+
+
+# ===========================================================================
+# Scene gathering (all mset access is here)
+# ===========================================================================
+def _all_objects_unique():
+    """Return every scene object exactly once, whether getAllObjects() is flat
+    or root-only."""
+    seen = {}
+    stack = list(mset.getAllObjects())
+    while stack:
+        o = stack.pop()
+        try:
+            uid = o.uid
+        except Exception:
+            uid = id(o)
+        if uid in seen:
+            continue
+        seen[uid] = o
+        try:
+            stack.extend(o.getChildren())
+        except Exception:
+            pass
+    return list(seen.values())
+
+
+def _effective_visible(obj):
+    """An object is visible only if it and all ancestors are visible."""
+    cur = obj
+    while cur is not None:
+        try:
+            if not cur.visible:
+                return False
+        except Exception:
+            pass
+        try:
+            cur = cur.parent
+        except Exception:
+            cur = None
+    return True
+
+
+def _is_mesh(obj):
+    try:
+        return isinstance(obj, mset.MeshObject)
+    except Exception:
+        return type(obj).__name__ == "MeshObject"
+
+
+def _collect_visible_meshes():
+    out = []
+    for o in _all_objects_unique():
+        if not _is_mesh(o):
+            continue
+        if not _effective_visible(o):
+            continue
+        try:
+            if o.invisibleToCamera:
+                continue
+        except Exception:
+            pass
+        out.append(o)
+    return out
+
+
+def _world_matrix_of(obj):
+    """Compose the full parent-chain world matrix for a scene object using the
+    plugin's Euler convention. world = parentWorld @ localTRS(pivot)."""
+    chain = []
+    cur = obj
+    while cur is not None:
+        chain.append(cur)
+        try:
+            cur = cur.parent
+        except Exception:
+            cur = None
+    W = la.IDENTITY
+    for node in reversed(chain):
+        pos = _vec3(getattr(node, "position", (0, 0, 0)))
+        rot = _vec3(getattr(node, "rotation", (0, 0, 0)))
+        scl = _vec3(getattr(node, "scale", (1, 1, 1)), default=1.0)
+        piv = _vec3(getattr(node, "pivot", (0, 0, 0)))
+        local = la.mat_mul_chain(
+            la.translation(pos),
+            la.translation(piv),
+            la.euler_to_matrix(rot[0], rot[1], rot[2], EULER_ORDER),
+            la.scaling(scl),
+            la.translation((-piv[0], -piv[1], -piv[2])),
+        )
+        W = la.mat_mul(W, local)
+    return W
+
+
+def _vec3(v, default=0.0):
+    try:
+        return (float(v[0]), float(v[1]), float(v[2]))
+    except Exception:
+        return (default, default, default)
+
+
+def _submeshes_of(mesh_obj):
+    """Return a list of projbake Submesh from a MeshObject's SubMeshObject
+    children. Falls back to a single whole-mesh submesh."""
+    subs = []
+    try:
+        for ch in mesh_obj.getChildren():
+            if type(ch).__name__ != "SubMeshObject":
+                continue
+            mat = None
+            try:
+                if ch.material is not None:
+                    mat = ch.material.name
+            except Exception:
+                mat = None
+            try:
+                start = int(ch.startIndex)
+                count = int(ch.indexCount)
+            except Exception:
+                continue
+            subs.append(Submesh(mat, start, count))
+    except Exception:
+        pass
+    return subs
+
+
+def _mesh_to_scenemesh(mesh_obj):
+    """Convert a Marmoset MeshObject into a world-space projbake SceneMesh."""
+    m = mesh_obj.mesh
+    verts = list(m.vertices)
+    tris = [int(i) for i in m.triangles]
+    uvs = list(m.uvs) if m.uvs else []
+    try:
+        norms = list(m.normals) if m.normals else None
+    except Exception:
+        norms = None
+    subs = _submeshes_of(mesh_obj)
+    if not subs:
+        # fall back to the mesh's own material name if reachable, else None
+        mat = None
+        try:
+            mat = mesh_obj.getChildren()[0].material.name
+        except Exception:
+            mat = None
+        subs = [Submesh(mat, 0, len(tris))]
+    W = _world_matrix_of(mesh_obj)
+    return SceneMesh(mesh_obj.name, verts, tris, uvs, norms,
+                     submeshes=subs, world_override=W)
+
+
+def _bounds_center(mesh_objs):
+    """Union AABB center of the given objects (world space). Falls back to the
+    whole-scene bounds, then the origin."""
+    lo = [None, None, None]
+    hi = [None, None, None]
+
+    def acc(b):
+        if not b:
+            return
+        mn, mx = b[0], b[1]
+        for k in range(3):
+            lo[k] = mn[k] if lo[k] is None else min(lo[k], mn[k])
+            hi[k] = mx[k] if hi[k] is None else max(hi[k], mx[k])
+
+    for o in mesh_objs:
+        try:
+            acc(o.getBounds())
+        except Exception:
+            pass
+    if lo[0] is None:
+        try:
+            acc(mset.getSceneBounds())
+        except Exception:
+            pass
+    if lo[0] is None:
+        return (0.0, 0.0, 0.0)
+    return ((lo[0] + hi[0]) * 0.5, (lo[1] + hi[1]) * 0.5, (lo[2] + hi[2]) * 0.5)
+
+
+# ===========================================================================
+# Turntable (physical scene rotation, exact under YXZ; restores originals)
+# ===========================================================================
+def _topmost_roots(mesh_objs):
+    """Unique top-most ancestors of the given meshes; rotating these turns the
+    whole visible group as a rigid body without double-rotating anything."""
+    roots = {}
+    for o in mesh_objs:
+        cur = o
+        parent = None
+        try:
+            parent = cur.parent
+        except Exception:
+            parent = None
+        while parent is not None:
+            cur = parent
+            try:
+                parent = cur.parent
+            except Exception:
+                parent = None
+        try:
+            roots[cur.uid] = cur
+        except Exception:
+            roots[id(cur)] = cur
+    return list(roots.values())
+
+
+def _snapshot(obj):
+    return {
+        "position": list(obj.position),
+        "rotation": list(obj.rotation),
+        "scale": list(getattr(obj, "scale", [1, 1, 1])),
+        "pivot": list(getattr(obj, "pivot", [0, 0, 0])),
+    }
+
+
+def _restore(obj, snap):
+    try:
+        obj.position = snap["position"]
+        obj.rotation = snap["rotation"]
+        obj.scale = snap["scale"]
+        obj.pivot = snap["pivot"]
+    except Exception as e:
+        _err("failed to restore %s: %s" % (getattr(obj, "name", "?"), e))
+
+
+def _apply_turntable_180(obj, center):
+    """Set obj to its 180-deg-about-world-Y (through center) pose.
+
+    Exact for the YXZ convention: pre-multiplying the world transform by
+    Ry(180)-about-C gives  pos' = C + Ry180(pos+pivot-C) - pivot  and
+    rot' = [rx, ry+180, rz]  (scale and pivot unchanged).
+    """
+    pos = _vec3(obj.position)
+    piv = _vec3(getattr(obj, "pivot", (0, 0, 0)))
+    rot = list(obj.rotation)
+    C = center
+    sx = pos[0] + piv[0] - C[0]
+    sy = pos[1] + piv[1] - C[1]
+    sz = pos[2] + piv[2] - C[2]
+    # Ry(180): (x,y,z) -> (-x, y, -z)
+    npos = [C[0] - sx - piv[0], C[1] + sy - piv[1], C[2] - sz - piv[2]]
+    obj.position = npos
+    obj.rotation = [rot[0], rot[1] + 180.0, rot[2]]
+
+
+# ===========================================================================
+# Capture
+# ===========================================================================
+def _capture(path, size):
+    """Render the current active camera to a square PNG with transparency and
+    return it decoded as an ImageRGBA."""
+    mset.renderCamera(path=path, width=size, height=size, transparency=True)
+    if not os.path.isfile(path):
+        raise RuntimeError("renderCamera did not write %s" % path)
+    return pngio.load_png(path)
+
+
+def _read_camera(width, height):
+    """Build the projection camera. ``width``/``height`` should be the ACTUAL
+    captured image size so the projection stays self-consistent even if
+    renderCamera produced a different resolution than requested."""
+    cam = mset.getCamera()
+    if cam is None:
+        raise RuntimeError("No active camera (mset.getCamera() returned None)")
+    mode = "perspective"
+    try:
+        mode = cam.mode
+    except Exception:
+        pass
+    ortho_scale = 1.0
+    try:
+        ortho_scale = float(cam.orthoScale)
+    except Exception:
+        pass
+    return la.Camera(
+        _vec3(cam.position), _vec3(cam.rotation), float(cam.fov),
+        width, height, mode=mode, ortho_scale=ortho_scale, euler_order=EULER_ORDER,
+    )
+
+
+# ===========================================================================
+# Main bake orchestration
+# ===========================================================================
+def _sanitize(name):
+    if not name:
+        return "material"
+    keep = "-_.() "
+    s = "".join(c if (c.isalnum() or c in keep) else "_" for c in str(name))
+    return s.strip() or "material"
+
+
+def run_bake(output_dir, size, side_mask_angle):
+    if not output_dir or not os.path.isdir(output_dir):
+        mset.showOkDialog("Please choose a valid Output Folder first.")
+        return
+    size = int(size)
+
+    meshes = _collect_visible_meshes()
+    if not meshes:
+        mset.showOkDialog("No visible mesh objects to bake.")
+        return
+    _log("visible meshes: %d" % len(meshes))
+
+    center = _bounds_center(meshes)
+    _log("turntable center: (%.3f, %.3f, %.3f)" % center)
+
+    front_path = os.path.join(output_dir, "_capture_front.png")
+    back_path = os.path.join(output_dir, "_capture_back.png")
+
+    _log("capturing FRONT...")
+    front_img = _capture(front_path, size)
+    # Build the camera from the ACTUAL capture resolution (renderCamera may not
+    # honour the requested size in every configuration).
+    camera = _read_camera(front_img.width, front_img.height)
+    _log("capture resolution: %dx%d" % (front_img.width, front_img.height))
+
+    roots = _topmost_roots(meshes)
+    snaps = [(r, _snapshot(r)) for r in roots]
+    _log("rotating %d root object(s) 180 about Y..." % len(roots))
+    try:
+        for r in roots:
+            _apply_turntable_180(r, center)
+        _log("capturing BACK...")
+        back_img = _capture(back_path, size)
+    finally:
+        # ALWAYS restore, even if the back capture failed
+        for r, snap in snaps:
+            _restore(r, snap)
+        _log("restored original transforms")
+
+    if (back_img.width, back_img.height) != (front_img.width, front_img.height):
+        _err("back capture size %dx%d != front %dx%d; projection may be off"
+             % (back_img.width, back_img.height, front_img.width, front_img.height))
+
+    scene_meshes = [_mesh_to_scenemesh(m) for m in meshes]
+    groups = group_by_material(scene_meshes)
+    _log("material groups: %s" % ", ".join(str(k) for k in groups.keys()))
+
+    results = bake.bake_scene(
+        scene_meshes, groups, front_img, back_img, camera, center,
+        size, float(side_mask_angle), euler_order=EULER_ORDER, log=_log,
+    )
+
+    written = []
+    scene_name = "bake"
+    try:
+        sp = mset.getScenePath()
+        if sp:
+            scene_name = os.path.splitext(os.path.basename(sp))[0] or "bake"
+    except Exception:
+        pass
+    for mat, img in results.items():
+        fname = "%s_%s.png" % (_sanitize(scene_name), _sanitize(mat))
+        out_path = os.path.join(output_dir, fname)
+        pngio.save_png(out_path, img)
+        written.append(out_path)
+        _log("wrote %s" % out_path)
+
+    mset.showOkDialog("Bake complete.\n\n%d texture(s) written to:\n%s"
+                      % (len(written), output_dir))
+
+
+# ===========================================================================
+# UI
+# ===========================================================================
+class CaptureBakeUI:
+    def __init__(self):
+        self.output_dir = self._default_output_dir()
+        self.window = mset.UIWindow("Capture Front Back Bake")
+        self._build()
+
+    def _default_output_dir(self):
+        try:
+            sp = mset.getScenePath()
+            if sp and os.path.isdir(os.path.dirname(sp)):
+                return os.path.dirname(sp)
+        except Exception:
+            pass
+        return _HERE
+
+    def _build(self):
+        w = self.window
+
+        # --- Output folder --------------------------------------------------
+        w.addElement(mset.UILabel("Output Folder:"))
+        w.addReturn()
+        browse = mset.UIButton("Browse...")
+        browse.onClick = self._pick_folder
+        w.addElement(browse)
+        w.addSpace(8)
+        self.folder_label = mset.UILabel(self.output_dir or "(none)")
+        w.addElement(self.folder_label)
+        w.addReturn()
+
+        # --- Texture size ---------------------------------------------------
+        w.addElement(mset.UILabel("Texture Size:"))
+        self.size_box = mset.UIListBox("Texture Size")
+        for s in TEXTURE_SIZES:
+            self.size_box.addItem(s)
+        try:
+            self.size_box.selectItemByName(DEFAULT_SIZE)
+        except Exception:
+            pass
+        w.addElement(self.size_box)
+        w.addReturn()
+
+        # --- Side mask angle ------------------------------------------------
+        w.addElement(mset.UILabel("Side Mask Angle (deg):"))
+        self.angle_field = mset.UITextFieldFloat()
+        try:
+            self.angle_field.value = DEFAULT_SIDE_MASK_ANGLE
+        except Exception:
+            pass
+        w.addElement(self.angle_field)
+        w.addReturn()
+
+        # --- Actions --------------------------------------------------------
+        w.addSpace(4)
+        bake_btn = mset.UIButton("Capture Front/Back And Bake")
+        bake_btn.onClick = self._on_bake
+        w.addElement(bake_btn)
+        w.addReturn()
+        close_btn = mset.UIButton("Close")
+        close_btn.onClick = self._on_close
+        w.addElement(close_btn)
+
+    # -- callbacks ----------------------------------------------------------
+    def _pick_folder(self):
+        try:
+            folder = mset.showOpenFolderDialog()
+        except Exception as e:
+            _err("folder dialog failed: %s" % e)
+            return
+        if folder:
+            self.output_dir = folder
+            try:
+                self.folder_label.text = folder
+            except Exception:
+                pass
+
+    def _selected_size(self):
+        try:
+            idx = self.size_box.selectedItem
+            if 0 <= idx < len(TEXTURE_SIZES):
+                return int(TEXTURE_SIZES[idx])
+        except Exception:
+            pass
+        return int(DEFAULT_SIZE)
+
+    def _selected_angle(self):
+        try:
+            v = float(self.angle_field.value)
+            if 0.0 < v < 90.0:
+                return v
+        except Exception:
+            pass
+        return DEFAULT_SIDE_MASK_ANGLE
+
+    def _on_bake(self):
+        try:
+            run_bake(self.output_dir, self._selected_size(), self._selected_angle())
+        except Exception as e:
+            _err("bake failed: %s\n%s" % (e, traceback.format_exc()))
+            try:
+                mset.showOkDialog("Bake failed:\n%s\n\nSee the log for details." % e)
+            except Exception:
+                pass
+
+    def _on_close(self):
+        try:
+            self.window.close()
+        except Exception:
+            pass
+        try:
+            mset.shutdownPlugin()
+        except Exception:
+            pass
+
+
+# keep a module-level reference so the window is not garbage collected
+_ui = None
+
+
+def main():
+    global _ui
+    _ui = CaptureBakeUI()
+
+
+if __name__ == "__main__":
+    main()

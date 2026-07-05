@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Test / demo artifacts
+tests/_demo_out/
+*.tmp
+
+# Marmoset capture intermediates
+_capture_front.png
+_capture_back.png
+
+# OS
+.DS_Store
