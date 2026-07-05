@@ -384,6 +384,23 @@ def test_edge_blur():
           "edge_blur radius 0 is a no-op copy")
 
 
+def test_composite():
+    print("[postprocess: composite_max_alpha]")
+    from projbake import postprocess
+    base = ImageRGBA(3, 1)
+    base.set(0, 0, (255, 0, 0, 255))   # opaque red
+    base.set(1, 0, (0, 0, 0, 0))       # transparent
+    base.set(2, 0, (10, 20, 30, 120))  # partial
+    ov = ImageRGBA(3, 1)
+    ov.set(0, 0, (0, 255, 0, 100))     # less opaque than base -> base kept
+    ov.set(1, 0, (0, 0, 255, 255))     # base transparent -> overlay fills
+    ov.set(2, 0, (9, 9, 9, 200))       # more opaque -> overlay wins
+    postprocess.composite_max_alpha(base, ov)
+    check(base.get(0, 0) == (255, 0, 0, 255), "composite keeps the more-opaque base texel")
+    check(base.get(1, 0) == (0, 0, 255, 255), "composite fills where base was transparent")
+    check(base.get(2, 0) == (9, 9, 9, 200), "composite takes the more-opaque overlay texel")
+
+
 def main():
     test_linalg()
     test_camera()
@@ -396,6 +413,7 @@ def main():
     test_bake_occlusion()
     test_cross_object_occlusion()
     test_edge_blur()
+    test_composite()
     print()
     if _failures:
         print("FAILED %d check(s):" % len(_failures))

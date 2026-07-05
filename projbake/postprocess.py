@@ -20,6 +20,26 @@ from array import array
 from .image import ImageRGBA
 
 
+def composite_max_alpha(base, overlay):
+    """Merge ``overlay`` into ``base`` in place: for each texel keep whichever
+    contributor is more opaque. Used to combine per-object bakes that share a
+    material (their UV islands are normally disjoint, so this just fills each
+    object's region; at any overlap the more-covered sample wins). Both images
+    must be the same size.
+    """
+    if base.width != overlay.width or base.height != overlay.height:
+        raise ValueError("composite size mismatch")
+    bd = base.data
+    od = overlay.data
+    for i in range(0, len(bd), 4):
+        if od[i + 3] > bd[i + 3]:
+            bd[i] = od[i]
+            bd[i + 1] = od[i + 1]
+            bd[i + 2] = od[i + 2]
+            bd[i + 3] = od[i + 3]
+    return base
+
+
 def _box_blur(values, W, H, radius):
     """Separable box blur of a flat float32 array (length W*H), edge-clamped so
     border pixels average only the in-bounds part of the window. Prefix sums use

@@ -256,27 +256,17 @@ def _bounds_center(mesh_objs):
 
 
 # ===========================================================================
-# Turntable (physical scene rotation, exact under YXZ; restores originals)
+# Turntable (physical rotation of one object, exact under YXZ; restores originals)
 # ===========================================================================
-def _topmost_roots(mesh_objs):
-    """Unique top-most ancestors of the given meshes; rotating these turns the
-    whole visible group as a rigid body without double-rotating anything."""
-    roots = {}
-    for o in mesh_objs:
-        cur = o
-        parent = getattr(cur, "parent", None)
-        while parent is not None and _has_transform(parent):
-            cur = parent
-            parent = getattr(cur, "parent", None)
-        try:
-            roots[cur.uid] = cur
-        except Exception:
-            roots[id(cur)] = cur
-    return list(roots.values())
-
-
-def _has_transform(obj):
-    return hasattr(obj, "position") and hasattr(obj, "rotation")
+def _is_ancestor(candidate, obj):
+    """True if ``candidate`` is somewhere up ``obj``'s parent chain (so hiding it
+    during isolation would also hide ``obj``)."""
+    cur = getattr(obj, "parent", None)
+    while cur is not None:
+        if cur is candidate:
+            return True
+        cur = getattr(cur, "parent", None)
+    return False
 
 
 def _snapshot(obj):
@@ -364,6 +354,38 @@ def _sanitize(name):
     return s.strip() or "material"
 
 
+def _capture_object_isolated(obj, others, size, front_path, back_path):
+    """Capture ``obj`` alone (other target meshes hidden) so nothing occludes it.
+
+    Returns ``(front_img, back_img, center)``. ``center`` is obj's own bounds
+    center, used both for the physical 180-deg turntable and by the bake so the
+    back projection matches. Restores visibility and transform no matter what.
+    """
+    to_hide = [o for o in others if o is not obj and not _is_ancestor(o, obj)]
+    vis_snap = [(o, o.visible) for o in to_hide]
+    try:
+        for o in to_hide:
+            try:
+                o.visible = False
+            except Exception:
+                pass
+        front_img = _capture(front_path, size)
+        center = _bounds_center([obj])
+        snap = _snapshot(obj)
+        try:
+            _apply_turntable_180(obj, center)
+            back_img = _capture(back_path, size)
+        finally:
+            _restore(obj, snap)
+    finally:
+        for o, v in vis_snap:
+            try:
+                o.visible = v
+            except Exception:
+                pass
+    return front_img, back_img, center
+
+
 def run_bake(output_dir, size, side_mask_angle, edge_blur_px=DEFAULT_EDGE_BLUR):
     if not output_dir or not os.path.isdir(output_dir):
         mset.showOkDialog("Please choose a valid Output Folder first.")
@@ -377,39 +399,6 @@ def run_bake(output_dir, size, side_mask_angle, edge_blur_px=DEFAULT_EDGE_BLUR):
         return
     _log("visible meshes: %d" % len(meshes))
 
-    center = _bounds_center(meshes)
-    _log("turntable center: (%.3f, %.3f, %.3f)" % center)
-
-    front_path = os.path.join(output_dir, "_capture_front.png")
-    back_path = os.path.join(output_dir, "_capture_back.png")
-
-    _log("capturing FRONT...")
-    front_img = _capture(front_path, size)
-    # Build the camera from the ACTUAL capture resolution (renderCamera may not
-    # honour the requested size in every configuration).
-    camera = _read_camera(front_img.width, front_img.height)
-    _log("capture resolution: %dx%d" % (front_img.width, front_img.height))
-
-    roots = _topmost_roots(meshes)
-    snaps = [(r, _snapshot(r)) for r in roots]
-    _log("rotating %d root object(s) 180 about Y..." % len(roots))
-    try:
-        for r in roots:
-            _apply_turntable_180(r, center)
-        _log("capturing BACK...")
-        back_img = _capture(back_path, size)
-    finally:
-        # ALWAYS restore, even if the back capture failed
-        for r, snap in snaps:
-            _restore(r, snap)
-        _log("restored original transforms")
-
-    if (back_img.width, back_img.height) != (front_img.width, front_img.height):
-        _err("back capture size %dx%d != front %dx%d; projection may be off"
-             % (back_img.width, back_img.height, front_img.width, front_img.height))
-
-    scene_meshes = [_mesh_to_scenemesh(m) for m in meshes]
-
     # Two outputs per material:
     #   masked - side-masked (grazing sides transparent) + occlusion, then edge-blur
     #   full   - no side masking: raw front/back merged projection (sides kept)
@@ -417,11 +406,36 @@ def run_bake(output_dir, size, side_mask_angle, edge_blur_px=DEFAULT_EDGE_BLUR):
         {"name": "masked", "side_mask_angle": float(side_mask_angle)},
         {"name": "full", "side_mask_angle": 90.0},
     ]
-    results = bake.bake_variants(
-        scene_meshes, front_img, back_img, camera, center,
-        size, variants, euler_order=EULER_ORDER, log=_log,
-    )
 
+    # Project each object in ISOLATION (others hidden) so a nearer object never
+    # erases the surface behind it, then composite per material. This is what
+    # fills the areas that a single combined screenshot leaves blank.
+    camera = None
+    composited = {}  # {material: {variant: ImageRGBA}}
+    for i, obj in enumerate(meshes):
+        _log("object %d/%d %r: isolated capture..." % (i + 1, len(meshes),
+                                                        getattr(obj, "name", "?")))
+        fpath = os.path.join(output_dir, "_capture_front_%d.png" % i)
+        bpath = os.path.join(output_dir, "_capture_back_%d.png" % i)
+        front_img, back_img, center = _capture_object_isolated(
+            obj, meshes, size, fpath, bpath)
+        if camera is None:
+            camera = _read_camera(front_img.width, front_img.height)
+            _log("capture resolution: %dx%d" % (front_img.width, front_img.height))
+
+        sm = _mesh_to_scenemesh(obj)
+        res = bake.bake_variants(
+            [sm], front_img, back_img, camera, center, size, variants,
+            euler_order=EULER_ORDER, log=None)
+        for mat, var_imgs in res.items():
+            slot = composited.setdefault(mat, {})
+            for var, img in var_imgs.items():
+                if var not in slot:
+                    slot[var] = img               # first object owns the buffer
+                else:
+                    postprocess.composite_max_alpha(slot[var], img)
+
+    results = composited
     written = []
     scene_name = "bake"
     try:

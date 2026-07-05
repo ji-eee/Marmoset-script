@@ -299,13 +299,24 @@ def main():
     # mesh instead of trying to rotate that non-transform parent.
     root = SceneObject("Scene Root")
     head.parent = root
+
+    # A separate FEATHER object floating in FRONT of the head's centre (z=2,
+    # between camera z=4 and head front z=1). In a single combined screenshot it
+    # would occlude the head's front-centre, leaving that head UV region blank.
+    # Per-object isolated capture must fill it with the head's own colour.
+    fverts = [-0.3, -0.5, 2.0, 0.3, -0.5, 2.0, 0.3, 0.5, 2.0, -0.3, 0.5, 2.0]
+    ftris = [0, 1, 2, 0, 2, 3]
+    fuvs = [0, 0, 1, 0, 1, 1, 0, 1]
+    fnorms = [0, 0, 1] * 4
+    feather = MeshObject("Feather", FakeMesh(fverts, ftris, fuvs, fnorms), "feather")
+
     # a hidden object that must be ignored
     hidden = MeshObject("Hidden", FakeMesh(sphere.vertices, sphere.triangles,
                                            sphere.uvs, sphere.normals), "hidden")
     hidden.visible = False
 
     camera = FakeCamera((0, 0, 4), (0, 0, 0), 45.0)
-    scene = [head, hidden]
+    scene = [head, feather, hidden]
 
     mock = make_mock_mset(scene, camera, size)
     sys.modules["mset"] = mock
@@ -325,24 +336,27 @@ def main():
     print("[plugin: run_bake]")
     plugin.run_bake(out_dir, size, 70.0, 0)  # edge_blur=0 for deterministic round-trip
 
-    # transforms restored?
+    # transforms + visibility restored?
     after = ([list(head.position), list(head.rotation),
               list(head.scale), list(head.pivot)])
-    check(before == after, "root transforms restored exactly after bake")
+    check(before == after, "head transform restored exactly after bake")
+    check(head.visible and feather.visible,
+          "object visibility restored after isolated captures")
 
-    # captures written
-    check(os.path.isfile(os.path.join(out_dir, "_capture_front.png")),
-          "front capture PNG written")
-    check(os.path.isfile(os.path.join(out_dir, "_capture_back.png")),
-          "back capture PNG written")
+    # per-object isolated captures written
+    outs = [f for f in os.listdir(out_dir) if f.endswith(".png")]
+    check(any(f.startswith("_capture_front_") for f in outs),
+          "isolated front captures written")
+    check(any(f.startswith("_capture_back_") for f in outs),
+          "isolated back captures written")
 
     # two outputs per visible material (masked + full); 'hidden' must NOT appear
-    outs = [f for f in os.listdir(out_dir) if f.endswith(".png")
-            and not f.startswith("_capture")]
+    outs = [f for f in outs if not f.startswith("_capture")]
     check(any(f.endswith("_masked.png") and "head" in f for f in outs),
           "masked head texture written")
     check(any(f.endswith("_full.png") and "head" in f for f in outs),
           "full (front/back merged) head texture written")
+    check(any("feather" in f for f in outs), "feather texture written")
     check(not any("hidden" in f for f in outs),
           "hidden object's material not baked (%s)" % outs)
 
@@ -373,6 +387,18 @@ def main():
     check(rt_fail == 0 and checked >= 4,
           "round-trip: masked texels reconstruct their UV (%d checked)" % checked)
     check(0.1 < frac < 0.95, "masked coverage sane (%.1f%% opaque, sides masked)" % (100 * frac))
+
+    # THE FILL FIX: the head's front-centre (UV ~0.25,0.5) sits directly behind
+    # the feather. It must be FILLED with the head's own colour (isolated capture),
+    # not blank and not the feather's colour.
+    hx, hy = int(0.25 * baked.width), int(0.5 * baked.height)
+    hc = baked.get(hx, hy)
+    feather_col = color_uv(0.5, 0.5)   # what a feather-bleed would look like
+    head_col = color_uv(0.25, 0.5)
+    check(hc[3] == 255, "head area behind feather is FILLED (not blank) a=%d" % hc[3])
+    check(abs(hc[0] - head_col[0]) <= 16 and abs(hc[0] - feather_col[0]) > 30,
+          "filled area is head colour, not feather bleed (got=%s head=%s feather=%s)"
+          % (hc[:3], head_col[:3], feather_col[:3]))
 
     # the 'full' (no side mask) variant must cover MORE than the masked one
     full_png = [f for f in outs if "head" in f and f.endswith("_full.png")][0]
