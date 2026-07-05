@@ -23,6 +23,7 @@ from array import array
 
 from . import linalg as la
 from .image import ImageRGBA
+from .mesh import group_by_material
 
 INF = float("inf")
 
@@ -48,29 +49,35 @@ def _tri_screen(camera, p0, p1, p2):
     return ((a[0], a[1], a[2]), (b[0], b[1], b[2]), (c[0], c[1], c[2])), True
 
 
-def build_depth_buffer(meshes, camera, extra=None, euler_order="YXZ"):
-    """Rasterise all triangles into a nearest-depth (z) buffer of the capture size.
+def build_depth_id(meshes, camera, extra=None, euler_order="YXZ"):
+    """Rasterise all triangles into a nearest-depth buffer AND a nearest-object
+    id buffer of the capture size.
 
     Depth is the positive camera-space distance in front of the camera; smaller =
     nearer. Perspective-correct interpolation (1/depth) is used for perspective
-    cameras. Returns an ``array('f')`` of length W*H (row-major, top-left origin),
-    filled with +inf where nothing was drawn.
+    cameras. The id buffer stores, per pixel, the ``bake_id`` of the nearest mesh
+    (or -1 where nothing was drawn), so the baker can reject a texel when a
+    DIFFERENT object is the front-most surface at its pixel (cross-object bleed).
+    Returns ``(depth_array_f, id_array_i)``, each length W*H, row-major.
     """
     W, H = camera.width, camera.height
     depth = array("f", [INF]) * (W * H)
+    ids = array("i", [-1]) * (W * H)
     persp = camera.mode != "orthographic"
 
-    for m in meshes:
+    for idx, m in enumerate(meshes):
+        mid = m.bake_id if getattr(m, "bake_id", None) is not None else idx
         for _mat, (p0, p1, p2), _norms, _uvs in m.iter_world_triangles(extra, euler_order):
             verts, ok = _tri_screen(camera, p0, p1, p2)
             if not ok:
                 continue
             (x0, y0, d0), (x1, y1, d1), (x2, y2, d2) = verts
-            _rasterize_depth(depth, W, H, x0, y0, d0, x1, y1, d1, x2, y2, d2, persp)
-    return depth
+            _rasterize_depth(depth, ids, mid, W, H,
+                             x0, y0, d0, x1, y1, d1, x2, y2, d2, persp)
+    return depth, ids
 
 
-def _rasterize_depth(depth, W, H, x0, y0, d0, x1, y1, d1, x2, y2, d2, persp):
+def _rasterize_depth(depth, ids, mid, W, H, x0, y0, d0, x1, y1, d1, x2, y2, d2, persp):
     minx = int(math.floor(min(x0, x1, x2)))
     maxx = int(math.ceil(max(x0, x1, x2)))
     miny = int(math.floor(min(y0, y1, y2)))
@@ -112,31 +119,44 @@ def _rasterize_depth(depth, W, H, x0, y0, d0, x1, y1, d1, x2, y2, d2, persp):
             idx = row + px
             if d < depth[idx]:
                 depth[idx] = d
+                ids[idx] = mid
 
 
-def _visible(depth_buf, W, H, px, py, depth, bias_rel, bias_abs):
-    """True if a point at (px,py,depth) is the front-most surface (not occluded)."""
+def _visible(depth_buf, id_buf, W, H, px, py, depth, mesh_id, bias_rel, bias_abs):
+    """True if a point at (px,py,depth) belonging to ``mesh_id`` is the front-most
+    surface at that pixel (not occluded by itself or another object).
+
+    Two rejections:
+      * a DIFFERENT object is nearest here -> cross-object bleed (e.g. a feather
+        showing through a slot painting onto the head). Rejected via id_buf.
+      * the same object has a nearer surface here -> self-occlusion. Rejected via
+        the depth comparison.
+    """
     ix = int(px)
     iy = int(py)
     if ix < 0 or iy < 0 or ix >= W or iy >= H:
         return False
-    near = depth_buf[iy * W + ix]
+    j = iy * W + ix
+    near = depth_buf[j]
     if near == INF:
-        # nothing was rasterised here; treat as visible (edge of silhouette)
+        # nothing was rasterised here; let the background-alpha test decide
         return True
+    if id_buf[j] != mesh_id:
+        return False  # another object is in front -> occluded
     return depth <= near + (bias_abs + bias_rel * depth)
 
 
 def bake_group(meshes, front_img, back_img, camera, rc_matrix,
-               front_depth, back_depth, tex_size, side_mask_angle_deg,
+               front_depth, front_id, back_depth, back_id,
+               tex_size, side_mask_angle_deg,
                euler_order="YXZ", flip_v=True, occlusion_bias_rel=0.01,
                occlusion_bias_abs=1e-4, require_opaque_alpha=8):
     """Bake one material group into an ImageRGBA(tex_size, tex_size).
 
-    ``front_depth``/``back_depth`` are shared, whole-scene depth buffers so that
-    other objects correctly occlude this group. ``require_opaque_alpha`` is the
-    minimum capture alpha (0-255) for a sample to count as "hit the model" rather
-    than the transparent background.
+    ``front_depth``/``front_id`` (and back) are shared, whole-scene depth and
+    object-id buffers so that other objects correctly occlude this group.
+    ``require_opaque_alpha`` is the minimum capture alpha (0-255) for a sample to
+    count as "hit the model" rather than the transparent background.
     """
     size = tex_size
     out = ImageRGBA(size, size)
@@ -150,27 +170,29 @@ def bake_group(meshes, front_img, back_img, camera, rc_matrix,
     cam_fwd = camera.forward() if ortho else None
     Wc, Hc = camera.width, camera.height
 
-    fsample = front_img.sample_bilinear
-    bsample = back_img.sample_bilinear
+    # alpha-weighted sampling avoids dark fringes from the transparent background
+    fsample = front_img.sample_bilinear_weighted
+    bsample = back_img.sample_bilinear_weighted
 
     for m in meshes:
+        mid = m.bake_id if getattr(m, "bake_id", None) is not None else -1
         for _mat, (p0, p1, p2), (n0, n1, n2), (uv0, uv1, uv2) in \
                 m.iter_world_triangles(None, euler_order):
             _bake_triangle(
-                out_data, score, size, flip_v,
+                out_data, score, size, flip_v, mid,
                 p0, p1, p2, n0, n1, n2, uv0, uv1, uv2,
                 camera, cam_pos, ortho, cam_fwd, cos_thresh,
-                rc_matrix, rc3, front_depth, back_depth, Wc, Hc,
+                rc_matrix, rc3, front_depth, front_id, back_depth, back_id, Wc, Hc,
                 fsample, bsample, occlusion_bias_rel, occlusion_bias_abs,
                 require_opaque_alpha,
             )
     return out
 
 
-def _bake_triangle(out_data, score, size, flip_v,
+def _bake_triangle(out_data, score, size, flip_v, mesh_id,
                    p0, p1, p2, n0, n1, n2, uv0, uv1, uv2,
                    camera, cam_pos, ortho, cam_fwd, cos_thresh,
-                   rc_matrix, rc3, front_depth, back_depth, Wc, Hc,
+                   rc_matrix, rc3, front_depth, front_id, back_depth, back_id, Wc, Hc,
                    fsample, bsample, bias_rel, bias_abs, req_alpha):
     # UV -> texel coordinates (v-up flipped to top-left row order by default)
     def uv_px(uv):
@@ -238,7 +260,8 @@ def _bake_triangle(out_data, score, size, flip_v,
                 sx, sy, depth, in_front = project(P)
                 if not in_front:
                     continue
-                if not _visible(front_depth, Wc, Hc, sx, sy, depth, bias_rel, bias_abs):
+                if not _visible(front_depth, front_id, Wc, Hc, sx, sy, depth,
+                                mesh_id, bias_rel, bias_abs):
                     continue
                 sample = fsample(sx, sy)
             else:
@@ -255,7 +278,8 @@ def _bake_triangle(out_data, score, size, flip_v,
                 sx, sy, depth, in_front = project(Pr)
                 if not in_front:
                     continue
-                if not _visible(back_depth, Wc, Hc, sx, sy, depth, bias_rel, bias_abs):
+                if not _visible(back_depth, back_id, Wc, Hc, sx, sy, depth,
+                                mesh_id, bias_rel, bias_abs):
                     continue
                 sample = bsample(sx, sy)
                 use_back = True
@@ -277,30 +301,56 @@ def _bake_triangle(out_data, score, size, flip_v,
             out_data[o + 3] = 255
 
 
-def bake_scene(all_meshes, groups, front_img, back_img, camera, rot_center,
-               tex_size, side_mask_angle_deg, euler_order="YXZ", flip_v=True,
-               occlusion_bias_rel=0.01, occlusion_bias_abs=1e-4,
-               require_opaque_alpha=8, log=None):
-    """Top level: build shared depth buffers, bake every material group.
+def bake_variants(all_meshes, front_img, back_img, camera, rot_center,
+                  tex_size, variants, euler_order="YXZ", flip_v=True,
+                  occlusion_bias_rel=0.01, occlusion_bias_abs=1e-4,
+                  require_opaque_alpha=8, log=None):
+    """Build shared depth+id buffers once, then bake every material group for
+    each requested variant.
 
-    Returns ``{material_name: ImageRGBA}``. ``log`` is an optional callable.
+    ``variants`` is a list of dicts ``{"name": str, "side_mask_angle": float}``.
+    Returns ``{material_name: {variant_name: ImageRGBA}}``.
     """
     def _log(msg):
         if log:
             log(msg)
 
+    # Assign stable per-object ids used by the occlusion id-buffer, THEN build the
+    # per-material views so they inherit those ids (order matters).
+    for i, m in enumerate(all_meshes):
+        m.bake_id = i
+    groups = group_by_material(all_meshes)
+
     rc = turntable_matrix(rot_center, 180.0)
-    _log("Building front depth buffer (%dx%d)..." % (camera.width, camera.height))
-    front_depth = build_depth_buffer(all_meshes, camera, None, euler_order)
-    _log("Building back depth buffer...")
-    back_depth = build_depth_buffer(all_meshes, camera, rc, euler_order)
+    _log("Building front depth/id buffer (%dx%d)..." % (camera.width, camera.height))
+    front_depth, front_id = build_depth_id(all_meshes, camera, None, euler_order)
+    _log("Building back depth/id buffer...")
+    back_depth, back_id = build_depth_id(all_meshes, camera, rc, euler_order)
 
     results = {}
     for mat, meshes in groups.items():
-        _log("Baking material group %r (%d meshes)..." % (mat, len(meshes)))
-        results[mat] = bake_group(
-            meshes, front_img, back_img, camera, rc, front_depth, back_depth,
-            tex_size, side_mask_angle_deg, euler_order, flip_v,
-            occlusion_bias_rel, occlusion_bias_abs, require_opaque_alpha,
-        )
+        results[mat] = {}
+        for var in variants:
+            _log("Baking %r variant %r (%d meshes)..."
+                 % (mat, var["name"], len(meshes)))
+            results[mat][var["name"]] = bake_group(
+                meshes, front_img, back_img, camera, rc,
+                front_depth, front_id, back_depth, back_id,
+                tex_size, var["side_mask_angle"], euler_order, flip_v,
+                occlusion_bias_rel, occlusion_bias_abs, require_opaque_alpha,
+            )
     return results
+
+
+def bake_scene(all_meshes, front_img, back_img, camera, rot_center,
+               tex_size, side_mask_angle_deg, euler_order="YXZ", flip_v=True,
+               occlusion_bias_rel=0.01, occlusion_bias_abs=1e-4,
+               require_opaque_alpha=8, log=None):
+    """Single-variant bake. Returns ``{material: ImageRGBA}``."""
+    res = bake_variants(
+        all_meshes, front_img, back_img, camera, rot_center, tex_size,
+        [{"name": "out", "side_mask_angle": side_mask_angle_deg}],
+        euler_order, flip_v, occlusion_bias_rel, occlusion_bias_abs,
+        require_opaque_alpha, log,
+    )
+    return {mat: v["out"] for mat, v in res.items()}

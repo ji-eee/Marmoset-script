@@ -128,12 +128,18 @@ def main():
     pngio.save_png(os.path.join(out_dir, "back.png"), back)
 
     print("baking...")
-    groups = group_by_material([sphere])
-    res = bake.bake_scene([sphere], groups, front, back, cam, (0, 0, 0),
-                          size, 70.0, log=print)
-    baked = res["head"]
+    from projbake import postprocess
+    variants = [{"name": "masked", "side_mask_angle": 70.0},
+                {"name": "full", "side_mask_angle": 90.0}]
+    res = bake.bake_variants([sphere], front, back, cam, (0, 0, 0),
+                             size, variants, log=print)["head"]
+    baked = res["masked"]                       # side-masked, no blur (for asserts)
+    baked_blur = postprocess.edge_blur(baked, 3)  # req 1: soft edges
+    baked_full = res["full"]                    # req 3: front/back merged, no side mask
     pngio.save_png(os.path.join(out_dir, "baked.png"), baked)
-    print("wrote front/back/baked .png to", out_dir)
+    pngio.save_png(os.path.join(out_dir, "baked_masked_blur.png"), baked_blur)
+    pngio.save_png(os.path.join(out_dir, "baked_full.png"), baked_full)
+    print("wrote front/back/baked/baked_masked_blur/baked_full .png to", out_dir)
 
     # ---- round-trip correctness on sampled texels -------------------------
     failures = 0

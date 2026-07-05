@@ -61,11 +61,12 @@ class SceneMesh:
 
     __slots__ = ("name", "vertices", "triangles", "uvs", "normals",
                  "position", "rotation", "scale", "pivot", "submeshes",
-                 "world_override")
+                 "world_override", "bake_id")
 
     def __init__(self, name, vertices, triangles, uvs, normals=None,
                  position=(0, 0, 0), rotation=(0, 0, 0), scale=(1, 1, 1),
-                 pivot=(0, 0, 0), submeshes=None, world_override=None):
+                 pivot=(0, 0, 0), submeshes=None, world_override=None,
+                 bake_id=None):
         self.name = name
         self.vertices = vertices        # flat [x,y,z, ...]
         self.triangles = triangles      # flat [i0,i1,i2, ...] indices
@@ -76,6 +77,10 @@ class SceneMesh:
         self.scale = tuple(scale)
         self.pivot = tuple(pivot)
         self.world_override = world_override
+        # per-object id used by the baker's occlusion id-buffer to reject
+        # samples where a DIFFERENT object is the nearest surface (cross-object
+        # bleed). Assigned by bake.bake_variants; may be None outside a bake.
+        self.bake_id = bake_id
         # default: one submesh over the whole index buffer, material None
         if submeshes:
             self.submeshes = submeshes
@@ -88,7 +93,7 @@ class SceneMesh:
         return SceneMesh(self.name, self.vertices, self.triangles, self.uvs,
                          self.normals, self.position, self.rotation, self.scale,
                          self.pivot, submeshes=submeshes,
-                         world_override=self.world_override)
+                         world_override=self.world_override, bake_id=self.bake_id)
 
     def world_matrix(self, euler_order="YXZ"):
         if self.world_override is not None:

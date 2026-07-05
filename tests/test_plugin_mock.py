@@ -323,7 +323,7 @@ def main():
                list(head.scale), list(head.pivot)])
 
     print("[plugin: run_bake]")
-    plugin.run_bake(out_dir, size, 70.0)
+    plugin.run_bake(out_dir, size, 70.0, 0)  # edge_blur=0 for deterministic round-trip
 
     # transforms restored?
     after = ([list(head.position), list(head.rotation),
@@ -336,16 +336,24 @@ def main():
     check(os.path.isfile(os.path.join(out_dir, "_capture_back.png")),
           "back capture PNG written")
 
-    # one output per (visible) material; 'hidden' must NOT appear
+    # two outputs per visible material (masked + full); 'hidden' must NOT appear
     outs = [f for f in os.listdir(out_dir) if f.endswith(".png")
             and not f.startswith("_capture")]
-    check(any("head" in f for f in outs), "output texture for 'head' material written")
+    check(any(f.endswith("_masked.png") and "head" in f for f in outs),
+          "masked head texture written")
+    check(any(f.endswith("_full.png") and "head" in f for f in outs),
+          "full (front/back merged) head texture written")
     check(not any("hidden" in f for f in outs),
           "hidden object's material not baked (%s)" % outs)
 
-    # round-trip correctness on the head texture
-    head_png = [f for f in outs if "head" in f][0]
-    baked = pngio.load_png(os.path.join(out_dir, head_png))
+    def _coverage(fname):
+        im = pngio.load_png(os.path.join(out_dir, fname))
+        op = sum(1 for i in range(im.width * im.height) if im.data[i * 4 + 3] == 255)
+        return im, op / float(im.width * im.height)
+
+    # round-trip correctness on the masked head texture
+    head_png = [f for f in outs if "head" in f and f.endswith("_masked.png")][0]
+    baked, frac = _coverage(head_png)
     checked = 0
     rt_fail = 0
     for (u, v) in [(0.25, 0.5), (0.25, 0.4), (0.25, 0.6), (0.75, 0.5), (0.75, 0.45)]:
@@ -363,12 +371,15 @@ def main():
             print("    BAD uv(%.2f,%.2f) got=%s exp=%s err=%d" % (u, v, got[:3], exp[:3], err))
             rt_fail += 1
     check(rt_fail == 0 and checked >= 4,
-          "round-trip: baked texels reconstruct their UV (%d checked)" % checked)
+          "round-trip: masked texels reconstruct their UV (%d checked)" % checked)
+    check(0.1 < frac < 0.95, "masked coverage sane (%.1f%% opaque, sides masked)" % (100 * frac))
 
-    opaque = sum(1 for i in range(baked.width * baked.height)
-                 if baked.data[i * 4 + 3] == 255)
-    frac = opaque / float(baked.width * baked.height)
-    check(0.1 < frac < 0.95, "coverage sane (%.1f%% opaque, sides masked)" % (100 * frac))
+    # the 'full' (no side mask) variant must cover MORE than the masked one
+    full_png = [f for f in outs if "head" in f and f.endswith("_full.png")][0]
+    _, full_frac = _coverage(full_png)
+    check(full_frac > frac + 0.05,
+          "full variant covers more than masked (full=%.1f%% > masked=%.1f%%)"
+          % (100 * full_frac, 100 * frac))
 
     print()
     if _failures:

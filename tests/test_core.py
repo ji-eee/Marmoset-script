@@ -250,7 +250,7 @@ def test_bake_front_quad():
     back = ImageRGBA(128, 128, fill=(0, 0, 0, 0))
 
     groups = group_by_material([quad])
-    res = bake.bake_scene([quad], groups, front, back, cam, (0, 0, 0),
+    res = bake.bake_scene([quad], front, back, cam, (0, 0, 0),
                           256, 80.0, log=None)
     out = res["mat"]
     # The quad faces +Z, camera on +Z -> fully front-facing, no masking.
@@ -279,7 +279,7 @@ def test_bake_side_masking():
     front = ImageRGBA(128, 128, fill=(255, 255, 255, 255))
     back = ImageRGBA(128, 128, fill=(255, 255, 255, 255))
     groups = group_by_material([quad])
-    res = bake.bake_scene([quad], groups, front, back, cam, (0, 0, 0),
+    res = bake.bake_scene([quad], front, back, cam, (0, 0, 0),
                           128, 75.0)
     out = res["mat"]
     opaque = sum(1 for i in range(128 * 128) if out.data[i * 4 + 3] != 0)
@@ -297,7 +297,7 @@ def test_bake_back_capture():
     front = ImageRGBA(128, 128, fill=(0, 0, 0, 0))       # empty
     back = ImageRGBA(128, 128, fill=(0, 0, 255, 255))    # solid blue
     groups = group_by_material([quad])
-    res = bake.bake_scene([quad], groups, front, back, cam, (0, 0, 0),
+    res = bake.bake_scene([quad], front, back, cam, (0, 0, 0),
                           128, 80.0)
     out = res["mat"]
     center = out.get(64, 64)
@@ -321,13 +321,67 @@ def test_bake_occlusion():
     back = ImageRGBA(128, 128, fill=(0, 0, 0, 0))
     meshes = [near, far]
     groups = group_by_material(meshes)
-    res = bake.bake_scene(meshes, groups, front, back, cam, (0, 0, 0), 128, 85.0)
+    res = bake.bake_scene(meshes, front, back, cam, (0, 0, 0), 128, 85.0)
     near_out = res["near"]
     far_out = res["far"]
     near_center = near_out.get(64, 64)
     far_center = far_out.get(64, 64)
     check(near_center[3] == 255, "near quad receives colour (visible)")
     check(far_center[3] == 0, "far quad center masked (occluded by near quad)")
+
+
+def test_cross_object_occlusion():
+    print("[bake: cross-object occlusion (feather-in-slot bleed)]")
+    from projbake import bake as _bake
+    uvs = [(0, 0), (1, 0), (1, 1), (0, 1)]
+    # head plane at z=0; feather plane JUST in front (z=0.02, within depth bias)
+    head = _quad("head", [(-2, -2, 0), (2, -2, 0), (2, 2, 0), (-2, 2, 0)],
+                 uvs, (0, 0, 1), material="head")
+    feather = _quad("feather",
+                    [(-0.3, -0.3, 0.02), (0.3, -0.3, 0.02),
+                     (0.3, 0.3, 0.02), (-0.3, 0.3, 0.02)],
+                    uvs, (0, 0, 1), material="feather")
+    cam = la.Camera((0, 0, 5), (0, 0, 0), 60.0, 128, 128)
+    # front capture: green everywhere, RED where the feather is (screen center)
+    front = ImageRGBA(128, 128, fill=(0, 200, 0, 255))
+    for y in range(54, 74):
+        for x in range(54, 74):
+            front.set(x, y, (220, 0, 0, 255))
+    back = ImageRGBA(128, 128, fill=(0, 0, 0, 0))
+    res = _bake.bake_scene([head, feather], front, back, cam, (0, 0, 0), 128, 85.0)
+
+    head_img = res["head"]
+    center = head_img.get(64, 64)   # UV center -> world (0,0,0) -> behind feather
+    check(center[3] == 0,
+          "head texel behind feather masked (id-buffer stops cross-object bleed) a=%d"
+          % center[3])
+    corner = head_img.get(14, 64)   # off to the side -> not behind feather -> green
+    check(corner[3] == 255 and corner[1] > 150 and corner[0] < 80,
+          "head texel outside the feather sampled green (%s)" % (corner[:3],))
+    feather_img = res["feather"]
+    fc = feather_img.get(64, 64)
+    check(fc[3] == 255 and fc[0] > 150,
+          "feather texel samples its own red (%s)" % (fc[:3],))
+
+
+def test_edge_blur():
+    print("[postprocess: edge_blur]")
+    from projbake import postprocess
+    img = ImageRGBA(32, 32, fill=(0, 0, 0, 0))
+    for y in range(8, 24):
+        for x in range(8, 24):
+            img.set(x, y, (200, 50, 50, 255))
+    out = postprocess.edge_blur(img, 3)
+    check(out.get(16, 16) == (200, 50, 50, 255),
+          "edge_blur keeps deep interior exact")
+    e = out.get(25, 16)  # just outside the original opaque edge (was transparent)
+    check(0 < e[3] < 255, "edge_blur feathers alpha past the edge (a=%d)" % e[3])
+    check(e[0] > e[2] and e[0] > 60,
+          "edge_blur bleeds real colour outward, no black halo (rgb=%s)" % (e[:3],))
+    check(out.get(0, 0)[3] == 0,
+          "edge_blur leaves far transparent region transparent")
+    check(postprocess.edge_blur(img, 0).data == img.data,
+          "edge_blur radius 0 is a no-op copy")
 
 
 def main():
@@ -340,6 +394,8 @@ def main():
     test_bake_side_masking()
     test_bake_back_capture()
     test_bake_occlusion()
+    test_cross_object_occlusion()
+    test_edge_blur()
     print()
     if _failures:
         print("FAILED %d check(s):" % len(_failures))

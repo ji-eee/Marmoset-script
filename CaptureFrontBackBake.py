@@ -45,8 +45,9 @@ if _HERE not in sys.path:
 from projbake import linalg as la          # noqa: E402
 from projbake import pngio                 # noqa: E402
 from projbake.image import ImageRGBA       # noqa: E402
-from projbake.mesh import SceneMesh, Submesh, group_by_material  # noqa: E402
+from projbake.mesh import SceneMesh, Submesh  # noqa: E402
 from projbake import bake                  # noqa: E402
+from projbake import postprocess           # noqa: E402
 
 # ===========================================================================
 # Configuration
@@ -57,8 +58,11 @@ from projbake import bake                  # noqa: E402
 EULER_ORDER = "YXZ"
 
 TEXTURE_SIZES = ["512", "1024", "2048", "4096"]
-DEFAULT_SIZE = "2048"
+DEFAULT_SIZE = "1024"
 DEFAULT_SIDE_MASK_ANGLE = 75.0
+DEFAULT_EDGE_BLUR = 3            # px; feathers the masked-output island edges (0 = off)
+MIN_TEXTURE_SIZE = 16
+MAX_TEXTURE_SIZE = 8192
 
 
 def _log(msg):
@@ -360,11 +364,12 @@ def _sanitize(name):
     return s.strip() or "material"
 
 
-def run_bake(output_dir, size, side_mask_angle):
+def run_bake(output_dir, size, side_mask_angle, edge_blur_px=DEFAULT_EDGE_BLUR):
     if not output_dir or not os.path.isdir(output_dir):
         mset.showOkDialog("Please choose a valid Output Folder first.")
         return
     size = int(size)
+    edge_blur_px = int(edge_blur_px)
 
     meshes = _collect_visible_meshes()
     if not meshes:
@@ -404,12 +409,17 @@ def run_bake(output_dir, size, side_mask_angle):
              % (back_img.width, back_img.height, front_img.width, front_img.height))
 
     scene_meshes = [_mesh_to_scenemesh(m) for m in meshes]
-    groups = group_by_material(scene_meshes)
-    _log("material groups: %s" % ", ".join(str(k) for k in groups.keys()))
 
-    results = bake.bake_scene(
-        scene_meshes, groups, front_img, back_img, camera, center,
-        size, float(side_mask_angle), euler_order=EULER_ORDER, log=_log,
+    # Two outputs per material:
+    #   masked - side-masked (grazing sides transparent) + occlusion, then edge-blur
+    #   full   - no side masking: raw front/back merged projection (sides kept)
+    variants = [
+        {"name": "masked", "side_mask_angle": float(side_mask_angle)},
+        {"name": "full", "side_mask_angle": 90.0},
+    ]
+    results = bake.bake_variants(
+        scene_meshes, front_img, back_img, camera, center,
+        size, variants, euler_order=EULER_ORDER, log=_log,
     )
 
     written = []
@@ -420,15 +430,22 @@ def run_bake(output_dir, size, side_mask_angle):
             scene_name = os.path.splitext(os.path.basename(sp))[0] or "bake"
     except Exception:
         pass
-    for mat, img in results.items():
-        fname = "%s_%s.png" % (_sanitize(scene_name), _sanitize(mat))
-        out_path = os.path.join(output_dir, fname)
-        pngio.save_png(out_path, img)
-        written.append(out_path)
-        _log("wrote %s" % out_path)
+    for mat, var_imgs in results.items():
+        masked = var_imgs["masked"]
+        if edge_blur_px > 0:
+            _log("edge-blurring %r masked output (%dpx)..." % (mat, edge_blur_px))
+            masked = postprocess.edge_blur(masked, edge_blur_px)
+        base = "%s_%s" % (_sanitize(scene_name), _sanitize(mat))
+        for suffix, img in (("masked", masked), ("full", var_imgs["full"])):
+            out_path = os.path.join(output_dir, "%s_%s.png" % (base, suffix))
+            pngio.save_png(out_path, img)
+            written.append(out_path)
+            _log("wrote %s" % out_path)
 
-    mset.showOkDialog("Bake complete.\n\n%d texture(s) written to:\n%s"
-                      % (len(written), output_dir))
+    mset.showOkDialog(
+        "Bake complete.\n\n%d texture(s) written to:\n%s\n\n"
+        "Per material: _masked (sides masked + edge blur), "
+        "_full (front/back merged, no side mask)." % (len(written), output_dir))
 
 
 # ===========================================================================
@@ -473,6 +490,14 @@ class CaptureBakeUI:
         except Exception:
             pass
         w.addElement(self.size_box)
+        w.addSpace(8)
+        w.addElement(mset.UILabel("Custom (px, 0=preset):"))
+        self.custom_size_field = mset.UITextFieldInt()
+        try:
+            self.custom_size_field.value = 0
+        except Exception:
+            pass
+        w.addElement(self.custom_size_field)
         w.addReturn()
 
         # --- Side mask angle ------------------------------------------------
@@ -483,6 +508,14 @@ class CaptureBakeUI:
         except Exception:
             pass
         w.addElement(self.angle_field)
+        w.addSpace(8)
+        w.addElement(mset.UILabel("Edge Blur (px):"))
+        self.blur_field = mset.UITextFieldInt()
+        try:
+            self.blur_field.value = DEFAULT_EDGE_BLUR
+        except Exception:
+            pass
+        w.addElement(self.blur_field)
         w.addReturn()
 
         # --- Actions --------------------------------------------------------
@@ -510,6 +543,13 @@ class CaptureBakeUI:
                 pass
 
     def _selected_size(self):
+        # a positive custom value overrides the preset dropdown
+        try:
+            custom = int(self.custom_size_field.value)
+            if custom > 0:
+                return max(MIN_TEXTURE_SIZE, min(MAX_TEXTURE_SIZE, custom))
+        except Exception:
+            pass
         try:
             idx = self.size_box.selectedItem
             if 0 <= idx < len(TEXTURE_SIZES):
@@ -527,9 +567,19 @@ class CaptureBakeUI:
             pass
         return DEFAULT_SIDE_MASK_ANGLE
 
+    def _selected_edge_blur(self):
+        try:
+            v = int(self.blur_field.value)
+            if v >= 0:
+                return v
+        except Exception:
+            pass
+        return DEFAULT_EDGE_BLUR
+
     def _on_bake(self):
         try:
-            run_bake(self.output_dir, self._selected_size(), self._selected_angle())
+            run_bake(self.output_dir, self._selected_size(),
+                     self._selected_angle(), self._selected_edge_blur())
         except Exception as e:
             _err("bake failed: %s\n%s" % (e, traceback.format_exc()))
             try:

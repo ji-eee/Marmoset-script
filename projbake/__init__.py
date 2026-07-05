@@ -10,6 +10,7 @@ Modules:
     pngio     - minimal, dependency-free PNG read/write (stdlib zlib only)
     mesh      - mesh geometry container + object transform -> world space
     bake      - the reverse-projection (gather) baker with occlusion + side mask
+    postprocess - baked-texture post-processing (soft/blurred island edges)
 """
 
-__all__ = ["linalg", "image", "pngio", "mesh", "bake"]
+__all__ = ["linalg", "image", "pngio", "mesh", "bake", "postprocess"]

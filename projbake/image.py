@@ -90,5 +90,48 @@ class ImageRGBA:
             out.append(top * (1 - ty) + bot * ty)
         return tuple(out)
 
+    def sample_bilinear_weighted(self, px, py):
+        """Like :meth:`sample_bilinear` but the RGB channels are weighted by each
+        texel's alpha, so (near-)transparent background texels don't drag the
+        colour toward black at silhouette edges. The returned alpha is the plain
+        bilinear alpha. Returns ``None`` if the sample center is out of bounds.
+        """
+        fx = px - 0.5
+        fy = py - 0.5
+        if fx < -0.5 or fy < -0.5 or fx > self.width - 0.5 or fy > self.height - 0.5:
+            return None
+        x0 = int(fx) if fx >= 0 else int(fx) - 1
+        y0 = int(fy) if fy >= 0 else int(fy) - 1
+        tx = fx - x0
+        ty = fy - y0
+        x1 = x0 + 1
+        y1 = y0 + 1
+        w, h = self.width, self.height
+        cx0 = 0 if x0 < 0 else (w - 1 if x0 > w - 1 else x0)
+        cx1 = 0 if x1 < 0 else (w - 1 if x1 > w - 1 else x1)
+        cy0 = 0 if y0 < 0 else (h - 1 if y0 > h - 1 else y0)
+        cy1 = 0 if y1 < 0 else (h - 1 if y1 > h - 1 else y1)
+        samples = (
+            (self.get(cx0, cy0), (1 - tx) * (1 - ty)),
+            (self.get(cx1, cy0), tx * (1 - ty)),
+            (self.get(cx0, cy1), (1 - tx) * ty),
+            (self.get(cx1, cy1), tx * ty),
+        )
+        a_sum = 0.0     # plain bilinear alpha
+        aw_sum = 0.0    # sum of weight*alpha (rgb normaliser)
+        r = g = b = 0.0
+        for (p, wgt) in samples:
+            a_sum += wgt * p[3]
+            wa = wgt * p[3]
+            aw_sum += wa
+            r += p[0] * wa
+            g += p[1] * wa
+            b += p[2] * wa
+        if aw_sum > 1e-6:
+            r /= aw_sum
+            g /= aw_sum
+            b /= aw_sum
+        return (r, g, b, a_sum)
+
     def to_bytes(self):
         return self.data.tobytes()
