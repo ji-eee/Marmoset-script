@@ -66,7 +66,7 @@ C:\Users\<사용자>\AppData\Local\Marmoset Toolbag 5\plugins\CaptureFrontBackBa
    Edge Blur(px, 기본 3, 0이면 끔) 확인
 4. Capture Front/Back And Bake 클릭
 5. 출력 폴더에 메테리얼마다 2장 생성(중간 캡처 파일은 자동 삭제됨)
-   - `<씬>_<메테리얼>_masked.png` — 옆면 마스킹 + 테두리 블러(최종용)
+   - `<씬>_<메테리얼>_masked.png` — 옆면 마스킹 + 테두리 블러 + RGB 패딩(알파는 마스크 유지, 최종용)
    - `<씬>_<메테리얼>_full.png` — 마스킹 없이 앞뒤 스미어, 투명 영역 없이 완전 불투명(비교/원본용)
 
 의존성 없음. Marmoset 내장 파이썬(3.9)만으로 동작. numpy/Pillow 불필요.

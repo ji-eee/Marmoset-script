@@ -398,6 +398,14 @@ def main():
           "filled area is head colour, not feather bleed (got=%s head=%s feather=%s)"
           % (hc[:3], head_col[:3], feather_col[:3]))
 
+    # masked: transparent (masked) texels must carry padded RGB so texture
+    # filtering on the model doesn't blend background colour at UV borders
+    sx, sy = int(0.01 * baked.width), int(0.5 * baked.height)
+    side = baked.get(sx, sy)
+    check(side[3] == 0, "masked side texel still transparent (a=%d)" % side[3])
+    check(side[:3] != (0, 0, 0),
+          "masked side texel RGB padded from nearest island (%s)" % (side[:3],))
+
     # the 'full' variant must be FULLY OPAQUE (no transparent texels at all)
     full_png = [f for f in outs if "head" in f and f.endswith("_full.png")][0]
     full_img, full_frac = _coverage(full_png)

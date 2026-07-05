@@ -455,6 +455,10 @@ def run_bake(output_dir, size, side_mask_angle, edge_blur_px=DEFAULT_EDGE_BLUR):
         if edge_blur_px > 0:
             _log("edge-blurring %r masked output (%dpx)..." % (mat, edge_blur_px))
             masked = postprocess.edge_blur(masked, edge_blur_px)
+        # pad RGB into the transparent mask (alpha untouched) so texture
+        # filtering on the model doesn't blend background colour at UV borders
+        _log("padding %r masked output rgb..." % (mat,))
+        masked = postprocess.pad_rgb(masked)
         _log("filling %r full output (no transparency)..." % (mat,))
         full = postprocess.fill_transparent(var_imgs["full"])
         base = "%s_%s" % (_sanitize(scene_name), _sanitize(mat))

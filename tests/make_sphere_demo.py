@@ -134,7 +134,7 @@ def main():
     res = bake.bake_variants([sphere], front, back, cam, (0, 0, 0),
                              size, variants, log=print)["head"]
     baked = res["masked"]                       # side-masked, no blur (for asserts)
-    baked_blur = postprocess.edge_blur(baked, 3)   # soft edges
+    baked_blur = postprocess.pad_rgb(postprocess.edge_blur(baked, 3))  # blur + rgb pad
     baked_full = postprocess.fill_transparent(res["full"])  # fully opaque smear
     pngio.save_png(os.path.join(out_dir, "baked.png"), baked)
     pngio.save_png(os.path.join(out_dir, "baked_masked_blur.png"), baked_blur)

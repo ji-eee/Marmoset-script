@@ -21,18 +21,10 @@ from collections import deque
 from .image import ImageRGBA
 
 
-def fill_transparent(img, alpha_threshold=1):
-    """Flood-fill every transparent texel with the colour of its nearest
-    non-transparent texel (multi-source BFS), then force the whole image opaque.
-
-    Used for the "full" output so it has NO transparent areas: texels the smear
-    bake could not reach (behind-camera, off-capture, pure background) inherit
-    the nearest painted colour, which also acts as infinite UV padding and kills
-    background bleed at UV seams. Mutates ``img`` in place and returns it.
-    A fully-transparent image is returned unchanged (nothing to fill from).
-    """
-    W, H = img.width, img.height
-    d = img.data
+def _nearest_painted_map(d, W, H, alpha_threshold):
+    """Multi-source BFS from every texel with alpha >= threshold. Returns a flat
+    array mapping each texel index to the index of its nearest painted texel
+    (itself if painted), or ``None`` if nothing is painted at all."""
     n = W * H
     src = array("i", [-1]) * n
     q = deque()
@@ -41,7 +33,7 @@ def fill_transparent(img, alpha_threshold=1):
             src[i] = i
             q.append(i)
     if not q:
-        return img  # nothing painted at all; leave as-is
+        return None
     while q:
         i = q.popleft()
         s = src[i]
@@ -60,7 +52,25 @@ def fill_transparent(img, alpha_threshold=1):
         if j < n and src[j] < 0:
             src[j] = s
             q.append(j)
-    for i in range(n):
+    return src
+
+
+def fill_transparent(img, alpha_threshold=1):
+    """Flood-fill every transparent texel with the colour of its nearest
+    non-transparent texel, then force the whole image opaque.
+
+    Used for the "full" output so it has NO transparent areas: texels the smear
+    bake could not reach (behind-camera, off-capture, pure background) inherit
+    the nearest painted colour, which also acts as infinite UV padding and kills
+    background bleed at UV seams. Mutates ``img`` in place and returns it.
+    A fully-transparent image is returned unchanged (nothing to fill from).
+    """
+    W, H = img.width, img.height
+    d = img.data
+    src = _nearest_painted_map(d, W, H, alpha_threshold)
+    if src is None:
+        return img  # nothing painted at all; leave as-is
+    for i in range(W * H):
         o = i * 4
         s = src[i]
         if s != i:
@@ -69,6 +79,32 @@ def fill_transparent(img, alpha_threshold=1):
             d[o + 1] = d[so + 1]
             d[o + 2] = d[so + 2]
         d[o + 3] = 255
+    return img
+
+
+def pad_rgb(img, alpha_threshold=1):
+    """UV edge padding for MASKED outputs: copy the nearest painted texel's RGB
+    into every transparent texel while leaving the ALPHA channel untouched.
+
+    The mask (transparent side regions) is preserved, but texture filtering /
+    mipmapping on the model no longer blends in background colour at the alpha
+    boundary — this is what made the applied _masked texture look "off" at UV
+    island borders. Mutates ``img`` in place and returns it.
+    """
+    W, H = img.width, img.height
+    d = img.data
+    src = _nearest_painted_map(d, W, H, alpha_threshold)
+    if src is None:
+        return img  # nothing painted at all; leave as-is
+    for i in range(W * H):
+        s = src[i]
+        if s != i:
+            o = i * 4
+            so = s * 4
+            d[o] = d[so]
+            d[o + 1] = d[so + 1]
+            d[o + 2] = d[so + 2]
+            # alpha intentionally unchanged: the mask stays a mask
     return img
 
 

@@ -403,6 +403,27 @@ def test_fill_transparent():
           "fully-transparent image left unchanged (nothing to fill from)")
 
 
+def test_pad_rgb():
+    print("[postprocess: pad_rgb]")
+    from projbake import postprocess
+    img = ImageRGBA(8, 8, fill=(0, 0, 0, 0))
+    img.set(2, 2, (200, 10, 10, 255))
+    img.set(6, 6, (10, 200, 10, 120))  # partially transparent painted texel
+    out = postprocess.pad_rgb(img)
+    check(out.get(0, 0)[:3] == (200, 10, 10) and out.get(0, 0)[3] == 0,
+          "transparent texel gets nearest RGB but stays transparent")
+    check(out.get(7, 7)[:3] == (10, 200, 10) and out.get(7, 7)[3] == 0,
+          "far texel padded from its own nearest source, alpha still 0")
+    check(out.get(2, 2) == (200, 10, 10, 255), "opaque source texel unchanged")
+    check(out.get(6, 6) == (10, 200, 10, 120),
+          "partially transparent source keeps its own colour AND alpha")
+
+    empty = ImageRGBA(4, 4, fill=(0, 0, 0, 0))
+    postprocess.pad_rgb(empty)
+    check(all(empty.data[i] == 0 for i in range(4 * 4 * 4)),
+          "fully-transparent image left unchanged by pad_rgb")
+
+
 def test_unmasked_variant():
     print("[bake: unmasked (full) variant]")
     from projbake import bake as _bake
@@ -456,6 +477,7 @@ def main():
     test_cross_object_occlusion()
     test_edge_blur()
     test_fill_transparent()
+    test_pad_rgb()
     test_unmasked_variant()
     test_composite()
     print()
