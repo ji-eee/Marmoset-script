@@ -1,0 +1,7 @@
+# Windows scripts must check out with CRLF regardless of core.autocrlf
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+
+# everything else stays LF
+*.py  text eol=lf
+*.md  text eol=lf
