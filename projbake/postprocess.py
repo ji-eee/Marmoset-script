@@ -16,8 +16,60 @@ even at 4096x4096.
 """
 
 from array import array
+from collections import deque
 
 from .image import ImageRGBA
+
+
+def fill_transparent(img, alpha_threshold=1):
+    """Flood-fill every transparent texel with the colour of its nearest
+    non-transparent texel (multi-source BFS), then force the whole image opaque.
+
+    Used for the "full" output so it has NO transparent areas: texels the smear
+    bake could not reach (behind-camera, off-capture, pure background) inherit
+    the nearest painted colour, which also acts as infinite UV padding and kills
+    background bleed at UV seams. Mutates ``img`` in place and returns it.
+    A fully-transparent image is returned unchanged (nothing to fill from).
+    """
+    W, H = img.width, img.height
+    d = img.data
+    n = W * H
+    src = array("i", [-1]) * n
+    q = deque()
+    for i in range(n):
+        if d[i * 4 + 3] >= alpha_threshold:
+            src[i] = i
+            q.append(i)
+    if not q:
+        return img  # nothing painted at all; leave as-is
+    while q:
+        i = q.popleft()
+        s = src[i]
+        x = i % W
+        if x > 0 and src[i - 1] < 0:
+            src[i - 1] = s
+            q.append(i - 1)
+        if x < W - 1 and src[i + 1] < 0:
+            src[i + 1] = s
+            q.append(i + 1)
+        j = i - W
+        if j >= 0 and src[j] < 0:
+            src[j] = s
+            q.append(j)
+        j = i + W
+        if j < n and src[j] < 0:
+            src[j] = s
+            q.append(j)
+    for i in range(n):
+        o = i * 4
+        s = src[i]
+        if s != i:
+            so = s * 4
+            d[o] = d[so]
+            d[o + 1] = d[so + 1]
+            d[o + 2] = d[so + 2]
+        d[o + 3] = 255
+    return img
 
 
 def composite_max_alpha(base, overlay):

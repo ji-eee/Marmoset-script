@@ -343,15 +343,13 @@ def main():
     check(head.visible and feather.visible,
           "object visibility restored after isolated captures")
 
-    # per-object isolated captures written
+    # intermediate captures must be cleaned up: only final files remain
     outs = [f for f in os.listdir(out_dir) if f.endswith(".png")]
-    check(any(f.startswith("_capture_front_") for f in outs),
-          "isolated front captures written")
-    check(any(f.startswith("_capture_back_") for f in outs),
-          "isolated back captures written")
+    leftovers = [f for f in outs if f.startswith("_")]
+    check(not leftovers,
+          "no intermediate _*.png left in output dir (%s)" % leftovers)
 
     # two outputs per visible material (masked + full); 'hidden' must NOT appear
-    outs = [f for f in outs if not f.startswith("_capture")]
     check(any(f.endswith("_masked.png") and "head" in f for f in outs),
           "masked head texture written")
     check(any(f.endswith("_full.png") and "head" in f for f in outs),
@@ -400,12 +398,17 @@ def main():
           "filled area is head colour, not feather bleed (got=%s head=%s feather=%s)"
           % (hc[:3], head_col[:3], feather_col[:3]))
 
-    # the 'full' (no side mask) variant must cover MORE than the masked one
+    # the 'full' variant must be FULLY OPAQUE (no transparent texels at all)
     full_png = [f for f in outs if "head" in f and f.endswith("_full.png")][0]
-    _, full_frac = _coverage(full_png)
-    check(full_frac > frac + 0.05,
-          "full variant covers more than masked (full=%.1f%% > masked=%.1f%%)"
-          % (100 * full_frac, 100 * frac))
+    full_img, full_frac = _coverage(full_png)
+    check(full_frac == 1.0,
+          "full variant fully opaque, no transparency (%.2f%% opaque)" % (100 * full_frac))
+    # and the model area must still round-trip correctly (fill didn't clobber it)
+    fx, fy = int(0.25 * full_img.width), int(0.5 * full_img.height)
+    fc = full_img.get(fx, fy)
+    exp = color_uv(0.25, 0.5)
+    check(max(abs(fc[i] - exp[i]) for i in range(2)) <= 16,
+          "full variant keeps correct colours on the model area (%s)" % (fc[:3],))
 
     print()
     if _failures:

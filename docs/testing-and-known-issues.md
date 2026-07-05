@@ -44,9 +44,11 @@ python3 tests/test_plugin_mock.py
    - 폴더째 복사(`CaptureFrontBackBake.py` + `projbake/`) 후 Edit > Plugins > Refresh
    - 창이 뜨고 버튼/리스트박스/텍스트필드가 정상인지. 생성자 시그니처가 다르면 로그(`mset.err`) 확인
 2. 캡처(오브젝트별 격리)
-   - Capture 클릭 시 오브젝트마다 `_capture_front_N.png`/`_capture_back_N.png`가 생기는지, 투명 배경(알파)이 맞는지
    - 격리 캡처 때 나머지 오브젝트가 실제로 숨겨졌다가 원복되는지(`visible` 토글)
    - 겹친 뒤쪽 오브젝트 면이 결과에서 채워지는지(요구사항 핵심)
+   - 중간 `_capture_*.png`가 베이크 후 출력 폴더에 남지 않는지(자동 삭제됨.
+     디버깅으로 캡처 원본이 필요하면 `run_bake`의 `os.remove` 부분을 잠시 주석 처리)
+   - `_full` 출력이 투명 영역 없이 완전 불투명인지, 모델에 적용 시 흰 테두리가 없는지
    - 요청한 정사각 해상도로 나오는지(아니어도 코드는 실제 크기로 투영 보정함)
 3. **Euler 규약(가장 중요)**
    - 베이크 결과가 좌우 반전/상하 반전/틀어짐 없이 UV에 맞게 찍히는지

@@ -401,10 +401,10 @@ def run_bake(output_dir, size, side_mask_angle, edge_blur_px=DEFAULT_EDGE_BLUR):
 
     # Two outputs per material:
     #   masked - side-masked (grazing sides transparent) + occlusion, then edge-blur
-    #   full   - no side masking: raw front/back merged projection (sides kept)
+    #   full   - unmasked front/back smear, later filled to be fully opaque
     variants = [
         {"name": "masked", "side_mask_angle": float(side_mask_angle)},
-        {"name": "full", "side_mask_angle": 90.0},
+        {"name": "full", "side_mask_angle": 90.0, "unmasked": True},
     ]
 
     # Project each object in ISOLATION (others hidden) so a nearer object never
@@ -419,6 +419,12 @@ def run_bake(output_dir, size, side_mask_angle, edge_blur_px=DEFAULT_EDGE_BLUR):
         bpath = os.path.join(output_dir, "_capture_back_%d.png" % i)
         front_img, back_img, center = _capture_object_isolated(
             obj, meshes, size, fpath, bpath)
+        # intermediates are decoded into memory; keep the output folder clean
+        for p in (fpath, bpath):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
         if camera is None:
             camera = _read_camera(front_img.width, front_img.height)
             _log("capture resolution: %dx%d" % (front_img.width, front_img.height))
@@ -449,8 +455,10 @@ def run_bake(output_dir, size, side_mask_angle, edge_blur_px=DEFAULT_EDGE_BLUR):
         if edge_blur_px > 0:
             _log("edge-blurring %r masked output (%dpx)..." % (mat, edge_blur_px))
             masked = postprocess.edge_blur(masked, edge_blur_px)
+        _log("filling %r full output (no transparency)..." % (mat,))
+        full = postprocess.fill_transparent(var_imgs["full"])
         base = "%s_%s" % (_sanitize(scene_name), _sanitize(mat))
-        for suffix, img in (("masked", masked), ("full", var_imgs["full"])):
+        for suffix, img in (("masked", masked), ("full", full)):
             out_path = os.path.join(output_dir, "%s_%s.png" % (base, suffix))
             pngio.save_png(out_path, img)
             written.append(out_path)
@@ -459,7 +467,7 @@ def run_bake(output_dir, size, side_mask_angle, edge_blur_px=DEFAULT_EDGE_BLUR):
     mset.showOkDialog(
         "Bake complete.\n\n%d texture(s) written to:\n%s\n\n"
         "Per material: _masked (sides masked + edge blur), "
-        "_full (front/back merged, no side mask)." % (len(written), output_dir))
+        "_full (front/back smear, fully opaque)." % (len(written), output_dir))
 
 
 # ===========================================================================
@@ -480,23 +488,36 @@ class CaptureBakeUI:
             pass
         return _HERE
 
+    # label column width; keeps all value fields left-aligned on one column
+    _LABEL_WIDTH = 150.0
+    _FIELD_WIDTH = 64.0
+
+    def _row_label(self, text):
+        lb = mset.UILabel(text)
+        try:
+            lb.fixedWidth = self._LABEL_WIDTH
+        except Exception:
+            pass
+        return lb
+
     def _build(self):
         w = self.window
 
         # --- Output folder --------------------------------------------------
-        w.addElement(mset.UILabel("Output Folder:"))
-        w.addReturn()
+        w.addElement(self._row_label("Output Folder:"))
         browse = mset.UIButton("Browse...")
         browse.onClick = self._pick_folder
         w.addElement(browse)
-        w.addSpace(8)
+        w.addReturn()
         self.folder_label = mset.UILabel(self.output_dir or "(none)")
         w.addElement(self.folder_label)
         w.addReturn()
+        w.addReturn()
 
-        # --- Texture size ---------------------------------------------------
-        w.addElement(mset.UILabel("Texture Size:"))
-        self.size_box = mset.UIListBox("Texture Size")
+        # --- Texture size (one setting per row; the ListBox draws its own
+        # title, so pass '' to avoid a doubled "Texture Size: Texture Size") --
+        w.addElement(self._row_label("Texture Size:"))
+        self.size_box = mset.UIListBox("")
         for s in TEXTURE_SIZES:
             self.size_box.addItem(s)
         try:
@@ -504,36 +525,44 @@ class CaptureBakeUI:
         except Exception:
             pass
         w.addElement(self.size_box)
-        w.addSpace(8)
-        w.addElement(mset.UILabel("Custom (px, 0=preset):"))
+        w.addReturn()
+
+        w.addElement(self._row_label("Custom Size (px):"))
         self.custom_size_field = mset.UITextFieldInt()
         try:
             self.custom_size_field.value = 0
+            self.custom_size_field.width = self._FIELD_WIDTH
         except Exception:
             pass
         w.addElement(self.custom_size_field)
+        w.addSpace(6)
+        w.addElement(mset.UILabel("(0 = use preset)"))
         w.addReturn()
 
         # --- Side mask angle ------------------------------------------------
-        w.addElement(mset.UILabel("Side Mask Angle (deg):"))
+        w.addElement(self._row_label("Side Mask Angle (deg):"))
         self.angle_field = mset.UITextFieldFloat()
         try:
             self.angle_field.value = DEFAULT_SIDE_MASK_ANGLE
+            self.angle_field.width = self._FIELD_WIDTH
         except Exception:
             pass
         w.addElement(self.angle_field)
-        w.addSpace(8)
-        w.addElement(mset.UILabel("Edge Blur (px):"))
+        w.addReturn()
+
+        # --- Edge blur --------------------------------------------------------
+        w.addElement(self._row_label("Edge Blur (px):"))
         self.blur_field = mset.UITextFieldInt()
         try:
             self.blur_field.value = DEFAULT_EDGE_BLUR
+            self.blur_field.width = self._FIELD_WIDTH
         except Exception:
             pass
         w.addElement(self.blur_field)
         w.addReturn()
+        w.addReturn()
 
         # --- Actions --------------------------------------------------------
-        w.addSpace(4)
         bake_btn = mset.UIButton("Capture Front/Back And Bake")
         bake_btn.onClick = self._on_bake
         w.addElement(bake_btn)

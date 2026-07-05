@@ -130,12 +130,12 @@ def main():
     print("baking...")
     from projbake import postprocess
     variants = [{"name": "masked", "side_mask_angle": 70.0},
-                {"name": "full", "side_mask_angle": 90.0}]
+                {"name": "full", "side_mask_angle": 90.0, "unmasked": True}]
     res = bake.bake_variants([sphere], front, back, cam, (0, 0, 0),
                              size, variants, log=print)["head"]
     baked = res["masked"]                       # side-masked, no blur (for asserts)
-    baked_blur = postprocess.edge_blur(baked, 3)  # req 1: soft edges
-    baked_full = res["full"]                    # req 3: front/back merged, no side mask
+    baked_blur = postprocess.edge_blur(baked, 3)   # soft edges
+    baked_full = postprocess.fill_transparent(res["full"])  # fully opaque smear
     pngio.save_png(os.path.join(out_dir, "baked.png"), baked)
     pngio.save_png(os.path.join(out_dir, "baked_masked_blur.png"), baked_blur)
     pngio.save_png(os.path.join(out_dir, "baked_full.png"), baked_full)

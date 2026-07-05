@@ -150,13 +150,18 @@ def bake_group(meshes, front_img, back_img, camera, rc_matrix,
                front_depth, front_id, back_depth, back_id,
                tex_size, side_mask_angle_deg,
                euler_order="YXZ", flip_v=True, occlusion_bias_rel=0.01,
-               occlusion_bias_abs=1e-4, require_opaque_alpha=8):
+               occlusion_bias_abs=1e-4, require_opaque_alpha=8, unmasked=False):
     """Bake one material group into an ImageRGBA(tex_size, tex_size).
 
     ``front_depth``/``front_id`` (and back) are shared, whole-scene depth and
     object-id buffers so that other objects correctly occlude this group.
     ``require_opaque_alpha`` is the minimum capture alpha (0-255) for a sample to
     count as "hit the model" rather than the transparent background.
+
+    ``unmasked=True`` is best-effort smear mode for the "full" output: no side
+    masking, no occlusion test and no background rejection — every texel takes
+    whichever of the front/back samples is more head-on and usable. Texels with
+    no usable sample stay transparent for a later fill pass.
     """
     size = tex_size
     out = ImageRGBA(size, size)
@@ -184,7 +189,7 @@ def bake_group(meshes, front_img, back_img, camera, rc_matrix,
                 camera, cam_pos, ortho, cam_fwd, cos_thresh,
                 rc_matrix, rc3, front_depth, front_id, back_depth, back_id, Wc, Hc,
                 fsample, bsample, occlusion_bias_rel, occlusion_bias_abs,
-                require_opaque_alpha,
+                require_opaque_alpha, unmasked,
             )
     return out
 
@@ -193,7 +198,7 @@ def _bake_triangle(out_data, score, size, flip_v, mesh_id,
                    p0, p1, p2, n0, n1, n2, uv0, uv1, uv2,
                    camera, cam_pos, ortho, cam_fwd, cos_thresh,
                    rc_matrix, rc3, front_depth, front_id, back_depth, back_id, Wc, Hc,
-                   fsample, bsample, bias_rel, bias_abs, req_alpha):
+                   fsample, bsample, bias_rel, bias_abs, req_alpha, unmasked=False):
     # UV -> texel coordinates (v-up flipped to top-left row order by default)
     def uv_px(uv):
         u, v = uv
@@ -256,7 +261,33 @@ def _bake_triangle(out_data, score, size, flip_v, mesh_id,
 
             use_back = False
             facing = facing_front
-            if facing_front >= cos_thresh:
+            if unmasked:
+                # best-effort smear: whichever of front/back is more head-on and
+                # yields a usable (non-empty) sample; no occlusion/background
+                # rejection. Misses stay transparent for the fill pass.
+                sample = None
+                sx, sy, depth, in_front = project(P)
+                if in_front:
+                    s = fsample(sx, sy)
+                    if s is not None and s[3] >= 1.0:
+                        sample = s
+                Pr = la.transform_point(rc_matrix, P)
+                Nr = la.v_normalize(la.transform_dir3(rc3, N))
+                if ortho:
+                    vcam_r = (-cam_fwd[0], -cam_fwd[1], -cam_fwd[2])
+                else:
+                    vcam_r = la.v_normalize(la.v_sub(cam_pos, Pr))
+                facing_back = Nr[0] * vcam_r[0] + Nr[1] * vcam_r[1] + Nr[2] * vcam_r[2]
+                if sample is None or facing_back > facing:
+                    sxb, syb, depthb, in_front_b = project(Pr)
+                    if in_front_b:
+                        s2 = bsample(sxb, syb)
+                        if s2 is not None and s2[3] >= 1.0:
+                            sample = s2
+                            facing = facing_back
+                if sample is None:
+                    continue
+            elif facing_front >= cos_thresh:
                 sx, sy, depth, in_front = project(P)
                 if not in_front:
                     continue
@@ -287,7 +318,7 @@ def _bake_triangle(out_data, score, size, flip_v, mesh_id,
 
             if sample is None:
                 continue
-            if sample[3] < req_alpha:
+            if not unmasked and sample[3] < req_alpha:
                 continue  # projected onto transparent background -> skip
 
             idx = rowbase + tx
@@ -308,7 +339,8 @@ def bake_variants(all_meshes, front_img, back_img, camera, rot_center,
     """Build shared depth+id buffers once, then bake every material group for
     each requested variant.
 
-    ``variants`` is a list of dicts ``{"name": str, "side_mask_angle": float}``.
+    ``variants`` is a list of dicts ``{"name": str, "side_mask_angle": float}``
+    with an optional ``"unmasked": True`` (see bake_group).
     Returns ``{material_name: {variant_name: ImageRGBA}}``.
     """
     def _log(msg):
@@ -338,6 +370,7 @@ def bake_variants(all_meshes, front_img, back_img, camera, rot_center,
                 front_depth, front_id, back_depth, back_id,
                 tex_size, var["side_mask_angle"], euler_order, flip_v,
                 occlusion_bias_rel, occlusion_bias_abs, require_opaque_alpha,
+                unmasked=var.get("unmasked", False),
             )
     return results
 

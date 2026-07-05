@@ -384,6 +384,48 @@ def test_edge_blur():
           "edge_blur radius 0 is a no-op copy")
 
 
+def test_fill_transparent():
+    print("[postprocess: fill_transparent]")
+    from projbake import postprocess
+    img = ImageRGBA(8, 8, fill=(0, 0, 0, 0))
+    img.set(2, 2, (200, 10, 10, 255))
+    img.set(6, 6, (10, 200, 10, 255))
+    out = postprocess.fill_transparent(img)
+    opaque = all(out.data[i * 4 + 3] == 255 for i in range(64))
+    check(opaque, "fill leaves no transparent texels")
+    check(out.get(2, 2) == (200, 10, 10, 255), "source texel colour unchanged")
+    check(out.get(0, 0)[:3] == (200, 10, 10), "corner filled from nearest source (red)")
+    check(out.get(7, 7)[:3] == (10, 200, 10), "far corner filled from its nearest source (green)")
+
+    empty = ImageRGBA(4, 4, fill=(0, 0, 0, 0))
+    postprocess.fill_transparent(empty)
+    check(all(empty.data[i * 4 + 3] == 0 for i in range(16)),
+          "fully-transparent image left unchanged (nothing to fill from)")
+
+
+def test_unmasked_variant():
+    print("[bake: unmasked (full) variant]")
+    from projbake import bake as _bake
+    # side-facing quad: fully masked in masked mode, fully painted in unmasked
+    corners = [(0, -1, -1), (0, -1, 1), (0, 1, 1), (0, 1, -1)]
+    uvs = [(0, 0), (1, 0), (1, 1), (0, 1)]
+    quad = _quad("side", corners, uvs, (1, 0, 0))
+    cam = la.Camera((0, 0, 5), (0, 0, 0), 60.0, 128, 128)
+    front = ImageRGBA(128, 128, fill=(255, 255, 255, 255))
+    back = ImageRGBA(128, 128, fill=(255, 255, 255, 255))
+    res = _bake.bake_variants(
+        [quad], front, back, cam, (0, 0, 0), 128,
+        [{"name": "m", "side_mask_angle": 75.0},
+         {"name": "u", "side_mask_angle": 90.0, "unmasked": True}])
+    m = res["mat"]["m"]
+    u = res["mat"]["u"]
+    m_opaque = sum(1 for i in range(128 * 128) if m.data[i * 4 + 3] != 0)
+    u_opaque = sum(1 for i in range(128 * 128) if u.data[i * 4 + 3] != 0)
+    check(m_opaque == 0, "masked variant still masks the side quad (%d)" % m_opaque)
+    check(u_opaque > 0.95 * 128 * 128,
+          "unmasked variant paints the grazing side quad (%d texels)" % u_opaque)
+
+
 def test_composite():
     print("[postprocess: composite_max_alpha]")
     from projbake import postprocess
@@ -413,6 +455,8 @@ def main():
     test_bake_occlusion()
     test_cross_object_occlusion()
     test_edge_blur()
+    test_fill_transparent()
+    test_unmasked_variant()
     test_composite()
     print()
     if _failures:
