@@ -260,22 +260,19 @@ def _topmost_roots(mesh_objs):
     roots = {}
     for o in mesh_objs:
         cur = o
-        parent = None
-        try:
-            parent = cur.parent
-        except Exception:
-            parent = None
-        while parent is not None:
+        parent = getattr(cur, "parent", None)
+        while parent is not None and _has_transform(parent):
             cur = parent
-            try:
-                parent = cur.parent
-            except Exception:
-                parent = None
+            parent = getattr(cur, "parent", None)
         try:
             roots[cur.uid] = cur
         except Exception:
             roots[id(cur)] = cur
     return list(roots.values())
+
+
+def _has_transform(obj):
+    return hasattr(obj, "position") and hasattr(obj, "rotation")
 
 
 def _snapshot(obj):

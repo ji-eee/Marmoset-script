@@ -72,6 +72,20 @@ class FakeMaterial:
         self.name = name
 
 
+class SceneObject:
+    _uid = 10000
+
+    def __init__(self, name):
+        SceneObject._uid += 1
+        self.uid = SceneObject._uid
+        self.name = name
+        self.visible = True
+        self.parent = None
+
+    def getChildren(self):
+        return []
+
+
 class MeshObject:
     _uid = 0
 
@@ -280,6 +294,11 @@ def main():
     sphere = build_uv_sphere(rings=32, sectors=64)
     head = MeshObject("Head", FakeMesh(sphere.vertices, sphere.triangles,
                                        sphere.uvs, sphere.normals), "head")
+    # Marmoset can place meshes under a plain SceneObject that has visibility
+    # and hierarchy, but no transform attributes. The bake should rotate the
+    # mesh instead of trying to rotate that non-transform parent.
+    root = SceneObject("Scene Root")
+    head.parent = root
     # a hidden object that must be ignored
     hidden = MeshObject("Hidden", FakeMesh(sphere.vertices, sphere.triangles,
                                            sphere.uvs, sphere.normals), "hidden")
