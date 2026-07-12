@@ -184,23 +184,25 @@ def test_single_view_mode():
           "single view does NOT turntable the mesh (rotation unchanged)")
 
     outs = [f for f in os.listdir(out) if f.endswith(".png")]
-    masked = [f for f in outs if "solo" in f and f.endswith("_masked.png")]
-    check(len(masked) == 1, "single-view masked output written (%s)" % outs)
-    if not masked:
+    # current-view mode emits ONLY the full texture (no masking)
+    check(not any(f.endswith("_masked.png") for f in outs),
+          "single view produces NO masked output (%s)" % outs)
+    full = [f for f in outs if "solo" in f and f.endswith("_full.png")]
+    check(len(full) == 1, "single view produces exactly one _full texture (%s)" % outs)
+    if not full:
         return
-    img = pngio.load_png(os.path.join(out, masked[0]))
+    img = pngio.load_png(os.path.join(out, full[0]))
 
     def sample(u, v):
         tx = min(int(u * img.width), img.width - 1)
         ty = min(int((1.0 - v) * img.height), img.height - 1)
         return img.get(tx, ty)
 
-    front = sample(0.25, 0.5)   # hemisphere facing the camera -> painted
-    back = sample(0.75, 0.5)    # hemisphere facing away -> masked (no back cap)
-    check(front[3] == 255 and abs(front[0] - int(0.25 * 255)) <= 28,
-          "current-view-facing texel painted (u=0.25 -> %s)" % (front[:3],))
-    check(back[3] == 0,
-          "away-facing texel masked in single view (a=%d, expect 0)" % back[3])
+    opaque = all(img.data[i * 4 + 3] == 255 for i in range(img.width * img.height))
+    check(opaque, "single-view full output is fully opaque (no transparency)")
+    front = sample(0.25, 0.5)   # hemisphere facing the camera -> projected colour
+    check(abs(front[0] - int(0.25 * 255)) <= 28 and abs(front[1] - int(0.5 * 255)) <= 28,
+          "current-view-facing texel has the projected UV colour (%s)" % (front[:3],))
 
 
 def test_ui_wiring():

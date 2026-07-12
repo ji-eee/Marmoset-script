@@ -514,13 +514,20 @@ def run_bake(output_dir, size, side_mask_angle, edge_blur_px=DEFAULT_EDGE_BLUR,
         return
     _log("visible meshes: %d" % len(meshes))
 
-    # Two outputs per material:
+    # Outputs per material:
     #   masked - side-masked (grazing sides transparent) + occlusion, then edge-blur
-    #   full   - unmasked front/back smear, later filled to be fully opaque
-    variants = [
-        {"name": "masked", "side_mask_angle": float(side_mask_angle)},
-        {"name": "full", "side_mask_angle": 90.0, "unmasked": True},
-    ]
+    #   full   - unmasked smear, later filled to be fully opaque
+    # Current-view mode produces ONLY the single full texture (no masking): one
+    # screenshot has no back side to mask against, and it skips the masked bake,
+    # its edge-blur/pad and its PNG, so it is faster.
+    full_var = {"name": "full", "side_mask_angle": 90.0, "unmasked": True}
+    if single_view:
+        variants = [full_var]
+    else:
+        variants = [
+            {"name": "masked", "side_mask_angle": float(side_mask_angle)},
+            full_var,
+        ]
 
     if target_mesh is None:
         results = _bake_self_isolated(output_dir, size, variants, meshes,
@@ -540,27 +547,37 @@ def run_bake(output_dir, size, side_mask_angle, edge_blur_px=DEFAULT_EDGE_BLUR,
     except Exception:
         pass
     for mat, var_imgs in results.items():
-        masked = var_imgs["masked"]
-        if edge_blur_px > 0:
-            _log("edge-blurring %r masked output (%dpx)..." % (mat, edge_blur_px))
-            masked = postprocess.edge_blur(masked, edge_blur_px)
-        # pad RGB into the transparent mask (alpha untouched) so texture
-        # filtering on the model doesn't blend background colour at UV borders
-        _log("padding %r masked output rgb..." % (mat,))
-        masked = postprocess.pad_rgb(masked)
-        _log("filling %r full output (no transparency)..." % (mat,))
-        full = postprocess.fill_transparent(var_imgs["full"])
         base = "%s_%s" % (_sanitize(scene_name), _sanitize(mat))
-        for suffix, img in (("masked", masked), ("full", full)):
-            out_path = os.path.join(output_dir, "%s_%s.png" % (base, suffix))
-            pngio.save_png(out_path, img)
+        # write whichever variants were baked (current-view mode has only 'full')
+        if "masked" in var_imgs:
+            masked = var_imgs["masked"]
+            if edge_blur_px > 0:
+                _log("edge-blurring %r masked output (%dpx)..." % (mat, edge_blur_px))
+                masked = postprocess.edge_blur(masked, edge_blur_px)
+            # pad RGB into the transparent mask (alpha untouched) so texture
+            # filtering on the model doesn't blend background colour at UV borders
+            _log("padding %r masked output rgb..." % (mat,))
+            masked = postprocess.pad_rgb(masked)
+            out_path = os.path.join(output_dir, "%s_masked.png" % base)
+            pngio.save_png(out_path, masked)
+            written.append(out_path)
+            _log("wrote %s" % out_path)
+        if "full" in var_imgs:
+            _log("filling %r full output (no transparency)..." % (mat,))
+            full = postprocess.fill_transparent(var_imgs["full"])
+            out_path = os.path.join(output_dir, "%s_full.png" % base)
+            pngio.save_png(out_path, full)
             written.append(out_path)
             _log("wrote %s" % out_path)
 
+    if single_view:
+        detail = "Current view: one _full texture per material (no masking)."
+    else:
+        detail = ("Per material: _masked (sides masked + edge blur), "
+                  "_full (front/back smear, fully opaque).")
     mset.showOkDialog(
-        "Bake complete.\n\n%d texture(s) written to:\n%s\n\n"
-        "Per material: _masked (sides masked + edge blur), "
-        "_full (front/back smear, fully opaque)." % (len(written), output_dir))
+        "Bake complete.\n\n%d texture(s) written to:\n%s\n\n%s"
+        % (len(written), output_dir, detail))
 
 
 # ===========================================================================
