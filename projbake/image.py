@@ -95,10 +95,18 @@ class ImageRGBA:
         texel's alpha, so (near-)transparent background texels don't drag the
         colour toward black at silhouette edges. The returned alpha is the plain
         bilinear alpha. Returns ``None`` if the sample center is out of bounds.
+
+        Hot path: this runs once (or twice) per baked texel, so the four
+        ``get()`` calls and the 4-iteration accumulation loop are inlined with
+        direct ``data`` indexing. The arithmetic and its left-to-right order are
+        preserved exactly, so results are bit-for-bit identical to the readable
+        form above.
         """
+        w = self.width
+        h = self.height
         fx = px - 0.5
         fy = py - 0.5
-        if fx < -0.5 or fy < -0.5 or fx > self.width - 0.5 or fy > self.height - 0.5:
+        if fx < -0.5 or fy < -0.5 or fx > w - 0.5 or fy > h - 0.5:
             return None
         x0 = int(fx) if fx >= 0 else int(fx) - 1
         y0 = int(fy) if fy >= 0 else int(fy) - 1
@@ -106,27 +114,27 @@ class ImageRGBA:
         ty = fy - y0
         x1 = x0 + 1
         y1 = y0 + 1
-        w, h = self.width, self.height
         cx0 = 0 if x0 < 0 else (w - 1 if x0 > w - 1 else x0)
         cx1 = 0 if x1 < 0 else (w - 1 if x1 > w - 1 else x1)
         cy0 = 0 if y0 < 0 else (h - 1 if y0 > h - 1 else y0)
         cy1 = 0 if y1 < 0 else (h - 1 if y1 > h - 1 else y1)
-        samples = (
-            (self.get(cx0, cy0), (1 - tx) * (1 - ty)),
-            (self.get(cx1, cy0), tx * (1 - ty)),
-            (self.get(cx0, cy1), (1 - tx) * ty),
-            (self.get(cx1, cy1), tx * ty),
-        )
-        a_sum = 0.0     # plain bilinear alpha
-        aw_sum = 0.0    # sum of weight*alpha (rgb normaliser)
-        r = g = b = 0.0
-        for (p, wgt) in samples:
-            a_sum += wgt * p[3]
-            wa = wgt * p[3]
-            aw_sum += wa
-            r += p[0] * wa
-            g += p[1] * wa
-            b += p[2] * wa
+        d = self.data
+        r0 = cy0 * w
+        r1 = cy1 * w
+        i00 = (r0 + cx0) * 4
+        i10 = (r0 + cx1) * 4
+        i01 = (r1 + cx0) * 4
+        i11 = (r1 + cx1) * 4
+        # weight*alpha per sample, in the same order as the original loop
+        wa0 = ((1 - tx) * (1 - ty)) * d[i00 + 3]
+        wa1 = (tx * (1 - ty)) * d[i10 + 3]
+        wa2 = ((1 - tx) * ty) * d[i01 + 3]
+        wa3 = (tx * ty) * d[i11 + 3]
+        a_sum = wa0 + wa1 + wa2 + wa3   # plain bilinear alpha == rgb normaliser
+        aw_sum = a_sum
+        r = d[i00] * wa0 + d[i10] * wa1 + d[i01] * wa2 + d[i11] * wa3
+        g = d[i00 + 1] * wa0 + d[i10 + 1] * wa1 + d[i01 + 1] * wa2 + d[i11 + 1] * wa3
+        b = d[i00 + 2] * wa0 + d[i10 + 2] * wa1 + d[i01 + 2] * wa2 + d[i11 + 2] * wa3
         if aw_sum > 1e-6:
             r /= aw_sum
             g /= aw_sum

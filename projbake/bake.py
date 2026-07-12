@@ -38,17 +38,6 @@ def turntable_matrix(center, angle_deg=180.0):
     )
 
 
-def _tri_screen(camera, p0, p1, p2):
-    """Project a triangle; return (verts, ok) where verts is list of
-    (px,py,depth) and ok is False if any vertex is behind the camera."""
-    a = camera.project(p0)
-    b = camera.project(p1)
-    c = camera.project(p2)
-    if not (a[3] and b[3] and c[3]):
-        return None, False
-    return ((a[0], a[1], a[2]), (b[0], b[1], b[2]), (c[0], c[1], c[2])), True
-
-
 def build_depth_id(meshes, camera, extra=None, euler_order="YXZ"):
     """Rasterise all triangles into a nearest-depth buffer AND a nearest-object
     id buffer of the capture size.
@@ -65,13 +54,49 @@ def build_depth_id(meshes, camera, extra=None, euler_order="YXZ"):
     ids = array("i", [-1]) * (W * H)
     persp = camera.mode != "orthographic"
 
+    # Hoist the camera projection so the per-vertex project() (3x per triangle)
+    # avoids the method dispatch + to_camera_space tuple. The view matrix is
+    # rigid (w == 1.0), so the homogeneous divide is dropped without changing a
+    # bit; arithmetic order matches camera.project exactly.
+    vm = camera.view
+    v0 = vm[0]; v1 = vm[1]; v2 = vm[2]; v3 = vm[3]
+    v4 = vm[4]; v5 = vm[5]; v6 = vm[6]; v7 = vm[7]
+    v8 = vm[8]; v9 = vm[9]; v10 = vm[10]; v11 = vm[11]
+    tan_h = camera._tan_half_h
+    tan_v = camera._tan_half_v
+    if not persp:
+        half_h = camera.ortho_scale * 0.5
+        half_w = half_h * camera.aspect
+
+    def pr(px, py, pz):
+        xc = v0 * px + v1 * py + v2 * pz + v3
+        yc = v4 * px + v5 * py + v6 * pz + v7
+        zc = v8 * px + v9 * py + v10 * pz + v11
+        depth_ = -zc
+        in_front = depth_ > 1e-9
+        if persp:
+            dd = depth_ if in_front else 1e-9
+            ndc_x = (xc / dd) / tan_h if tan_h else 0.0
+            ndc_y = (yc / dd) / tan_v if tan_v else 0.0
+        else:
+            ndc_x = xc / half_w if half_w else 0.0
+            ndc_y = yc / half_h if half_h else 0.0
+        sx = (ndc_x * 0.5 + 0.5) * W
+        sy = (0.5 - ndc_y * 0.5) * H
+        return sx, sy, depth_, in_front
+
     for idx, m in enumerate(meshes):
         mid = m.bake_id if getattr(m, "bake_id", None) is not None else idx
         for _mat, (p0, p1, p2), _norms, _uvs in m.iter_world_triangles(extra, euler_order):
-            verts, ok = _tri_screen(camera, p0, p1, p2)
-            if not ok:
+            x0, y0, d0, f0 = pr(p0[0], p0[1], p0[2])
+            if not f0:
                 continue
-            (x0, y0, d0), (x1, y1, d1), (x2, y2, d2) = verts
+            x1, y1, d1, f1 = pr(p1[0], p1[1], p1[2])
+            if not f1:
+                continue
+            x2, y2, d2, f2 = pr(p2[0], p2[1], p2[2])
+            if not f2:
+                continue
             _rasterize_depth(depth, ids, mid, W, H,
                              x0, y0, d0, x1, y1, d1, x2, y2, d2, persp)
     return depth, ids
@@ -230,7 +255,71 @@ def _bake_triangle(out_data, score, size, flip_v, mesh_id,
         return
     inv_area = 1.0 / area
 
-    project = camera.project
+    # ---- per-triangle hoist of everything the hot pixel loop needs ---------
+    # camera.project() is inlined below (perspective and orthographic paths
+    # preserved). The camera view matrix is rigid (last row 0,0,0,1) so
+    # transform_point's homogeneous divide is by 1.0 and is dropped without
+    # changing any bit; likewise the turntable matrix rc_matrix. v_normalize,
+    # v_sub, transform_dir3 and _visible are inlined as local closures. Every
+    # arithmetic expression and its left-to-right order is preserved, so the
+    # output is bit-for-bit identical to the readable per-call version.
+    sqrt = math.sqrt
+    vm = camera.view
+    v0 = vm[0]; v1 = vm[1]; v2 = vm[2]; v3 = vm[3]
+    v4 = vm[4]; v5 = vm[5]; v6 = vm[6]; v7 = vm[7]
+    v8 = vm[8]; v9 = vm[9]; v10 = vm[10]; v11 = vm[11]
+    tan_h = camera._tan_half_h
+    tan_v = camera._tan_half_v
+    if ortho:
+        half_h = camera.ortho_scale * 0.5
+        half_w = half_h * camera.aspect
+        ncf0 = -cam_fwd[0]; ncf1 = -cam_fwd[1]; ncf2 = -cam_fwd[2]
+    rm0 = rc_matrix[0]; rm1 = rc_matrix[1]; rm2 = rc_matrix[2]; rm3 = rc_matrix[3]
+    rm4 = rc_matrix[4]; rm5 = rc_matrix[5]; rm6 = rc_matrix[6]; rm7 = rc_matrix[7]
+    rm8 = rc_matrix[8]; rm9 = rc_matrix[9]; rm10 = rc_matrix[10]; rm11 = rc_matrix[11]
+    c0 = rc3[0]; c1 = rc3[1]; c2 = rc3[2]
+    c3 = rc3[3]; c4 = rc3[4]; c5 = rc3[5]
+    c6 = rc3[6]; c7 = rc3[7]; c8 = rc3[8]
+    cpx = cam_pos[0]; cpy = cam_pos[1]; cpz = cam_pos[2]
+
+    p0x = p0[0]; p0y = p0[1]; p0z = p0[2]
+    p1x = p1[0]; p1y = p1[1]; p1z = p1[2]
+    p2x = p2[0]; p2y = p2[1]; p2z = p2[2]
+    n0x = n0[0]; n0y = n0[1]; n0z = n0[2]
+    n1x = n1[0]; n1y = n1[1]; n1z = n1[2]
+    n2x = n2[0]; n2y = n2[1]; n2z = n2[2]
+
+    def proj(px, py, pz):
+        """Inlined camera.project(); returns (sx, sy, depth, in_front)."""
+        xc = v0 * px + v1 * py + v2 * pz + v3
+        yc = v4 * px + v5 * py + v6 * pz + v7
+        zc = v8 * px + v9 * py + v10 * pz + v11
+        depth = -zc
+        in_front = depth > 1e-9
+        if ortho:
+            ndc_x = xc / half_w if half_w else 0.0
+            ndc_y = yc / half_h if half_h else 0.0
+        else:
+            dd = depth if in_front else 1e-9
+            ndc_x = (xc / dd) / tan_h if tan_h else 0.0
+            ndc_y = (yc / dd) / tan_v if tan_v else 0.0
+        sx = (ndc_x * 0.5 + 0.5) * Wc
+        sy = (0.5 - ndc_y * 0.5) * Hc
+        return sx, sy, depth, in_front
+
+    def visible(depth_buf, id_buf, sxp, syp, depthp):
+        """Inlined _visible()."""
+        ix = int(sxp)
+        iy = int(syp)
+        if ix < 0 or iy < 0 or ix >= Wc or iy >= Hc:
+            return False
+        j = iy * Wc + ix
+        near = depth_buf[j]
+        if near == INF:
+            return True
+        if id_buf[j] != mesh_id:
+            return False
+        return depthp <= near + (bias_abs + bias_rel * depthp)
 
     for ty in range(miny, maxy + 1):
         ycen = ty + 0.5
@@ -245,19 +334,32 @@ def _bake_triangle(out_data, score, size, flip_v, mesh_id,
 
             # interpolate world position & normal (barycentric is affine-exact
             # for a planar triangle regardless of UV distortion)
-            P = (w0 * p0[0] + w1 * p1[0] + w2 * p2[0],
-                 w0 * p0[1] + w1 * p1[1] + w2 * p2[1],
-                 w0 * p0[2] + w1 * p1[2] + w2 * p2[2])
-            N = (w0 * n0[0] + w1 * n1[0] + w2 * n2[0],
-                 w0 * n0[1] + w1 * n1[1] + w2 * n2[1],
-                 w0 * n0[2] + w1 * n1[2] + w2 * n2[2])
-            N = la.v_normalize(N)
+            Px = w0 * p0x + w1 * p1x + w2 * p2x
+            Py = w0 * p0y + w1 * p1y + w2 * p2y
+            Pz = w0 * p0z + w1 * p1z + w2 * p2z
+            Nx = w0 * n0x + w1 * n1x + w2 * n2x
+            Ny = w0 * n0y + w1 * n1y + w2 * n2y
+            Nz = w0 * n0z + w1 * n1z + w2 * n2z
+            # N = v_normalize(N)
+            nl = sqrt(Nx * Nx + Ny * Ny + Nz * Nz)
+            if nl < 1e-20:
+                nx = 0.0; ny = 0.0; nz = 0.0
+            else:
+                ninv = 1.0 / nl
+                nx = Nx * ninv; ny = Ny * ninv; nz = Nz * ninv
 
             if ortho:
-                vcam = (-cam_fwd[0], -cam_fwd[1], -cam_fwd[2])
+                vcx = ncf0; vcy = ncf1; vcz = ncf2
             else:
-                vcam = la.v_normalize(la.v_sub(cam_pos, P))
-            facing_front = N[0] * vcam[0] + N[1] * vcam[1] + N[2] * vcam[2]
+                # vcam = v_normalize(v_sub(cam_pos, P))
+                ex = cpx - Px; ey = cpy - Py; ez = cpz - Pz
+                el = sqrt(ex * ex + ey * ey + ez * ez)
+                if el < 1e-20:
+                    vcx = 0.0; vcy = 0.0; vcz = 0.0
+                else:
+                    einv = 1.0 / el
+                    vcx = ex * einv; vcy = ey * einv; vcz = ez * einv
+            facing_front = nx * vcx + ny * vcy + nz * vcz
 
             use_back = False
             facing = facing_front
@@ -266,20 +368,38 @@ def _bake_triangle(out_data, score, size, flip_v, mesh_id,
                 # yields a usable (non-empty) sample; no occlusion/background
                 # rejection. Misses stay transparent for the fill pass.
                 sample = None
-                sx, sy, depth, in_front = project(P)
+                sx, sy, depth, in_front = proj(Px, Py, Pz)
                 if in_front:
                     s = fsample(sx, sy)
                     if s is not None and s[3] >= 1.0:
                         sample = s
-                Pr = la.transform_point(rc_matrix, P)
-                Nr = la.v_normalize(la.transform_dir3(rc3, N))
-                if ortho:
-                    vcam_r = (-cam_fwd[0], -cam_fwd[1], -cam_fwd[2])
+                # Pr = transform_point(rc_matrix, P)
+                Prx = rm0 * Px + rm1 * Py + rm2 * Pz + rm3
+                Pry = rm4 * Px + rm5 * Py + rm6 * Pz + rm7
+                Prz = rm8 * Px + rm9 * Py + rm10 * Pz + rm11
+                # Nr = v_normalize(transform_dir3(rc3, N))
+                trx = c0 * nx + c1 * ny + c2 * nz
+                try_ = c3 * nx + c4 * ny + c5 * nz
+                trz = c6 * nx + c7 * ny + c8 * nz
+                rl = sqrt(trx * trx + try_ * try_ + trz * trz)
+                if rl < 1e-20:
+                    nrx = 0.0; nry = 0.0; nrz = 0.0
                 else:
-                    vcam_r = la.v_normalize(la.v_sub(cam_pos, Pr))
-                facing_back = Nr[0] * vcam_r[0] + Nr[1] * vcam_r[1] + Nr[2] * vcam_r[2]
+                    rinv = 1.0 / rl
+                    nrx = trx * rinv; nry = try_ * rinv; nrz = trz * rinv
+                if ortho:
+                    vrx = ncf0; vry = ncf1; vrz = ncf2
+                else:
+                    erx = cpx - Prx; ery = cpy - Pry; erz = cpz - Prz
+                    erl = sqrt(erx * erx + ery * ery + erz * erz)
+                    if erl < 1e-20:
+                        vrx = 0.0; vry = 0.0; vrz = 0.0
+                    else:
+                        erinv = 1.0 / erl
+                        vrx = erx * erinv; vry = ery * erinv; vrz = erz * erinv
+                facing_back = nrx * vrx + nry * vry + nrz * vrz
                 if sample is None or facing_back > facing:
-                    sxb, syb, depthb, in_front_b = project(Pr)
+                    sxb, syb, depthb, in_front_b = proj(Prx, Pry, Prz)
                     if in_front_b:
                         s2 = bsample(sxb, syb)
                         if s2 is not None and s2[3] >= 1.0:
@@ -288,29 +408,45 @@ def _bake_triangle(out_data, score, size, flip_v, mesh_id,
                 if sample is None:
                     continue
             elif facing_front >= cos_thresh:
-                sx, sy, depth, in_front = project(P)
+                sx, sy, depth, in_front = proj(Px, Py, Pz)
                 if not in_front:
                     continue
-                if not _visible(front_depth, front_id, Wc, Hc, sx, sy, depth,
-                                mesh_id, bias_rel, bias_abs):
+                if not visible(front_depth, front_id, sx, sy, depth):
                     continue
                 sample = fsample(sx, sy)
             else:
                 # try the back capture using the rotated pose
-                Pr = la.transform_point(rc_matrix, P)
-                Nr = la.v_normalize(la.transform_dir3(rc3, N))
-                if ortho:
-                    vcam_r = (-cam_fwd[0], -cam_fwd[1], -cam_fwd[2])
+                # Pr = transform_point(rc_matrix, P)
+                Prx = rm0 * Px + rm1 * Py + rm2 * Pz + rm3
+                Pry = rm4 * Px + rm5 * Py + rm6 * Pz + rm7
+                Prz = rm8 * Px + rm9 * Py + rm10 * Pz + rm11
+                # Nr = v_normalize(transform_dir3(rc3, N))
+                trx = c0 * nx + c1 * ny + c2 * nz
+                try_ = c3 * nx + c4 * ny + c5 * nz
+                trz = c6 * nx + c7 * ny + c8 * nz
+                rl = sqrt(trx * trx + try_ * try_ + trz * trz)
+                if rl < 1e-20:
+                    nrx = 0.0; nry = 0.0; nrz = 0.0
                 else:
-                    vcam_r = la.v_normalize(la.v_sub(cam_pos, Pr))
-                facing_back = Nr[0] * vcam_r[0] + Nr[1] * vcam_r[1] + Nr[2] * vcam_r[2]
+                    rinv = 1.0 / rl
+                    nrx = trx * rinv; nry = try_ * rinv; nrz = trz * rinv
+                if ortho:
+                    vrx = ncf0; vry = ncf1; vrz = ncf2
+                else:
+                    erx = cpx - Prx; ery = cpy - Pry; erz = cpz - Prz
+                    erl = sqrt(erx * erx + ery * ery + erz * erz)
+                    if erl < 1e-20:
+                        vrx = 0.0; vry = 0.0; vrz = 0.0
+                    else:
+                        erinv = 1.0 / erl
+                        vrx = erx * erinv; vry = ery * erinv; vrz = erz * erinv
+                facing_back = nrx * vrx + nry * vry + nrz * vrz
                 if facing_back < cos_thresh:
                     continue  # grazing / side -> masked (leave transparent)
-                sx, sy, depth, in_front = project(Pr)
+                sx, sy, depth, in_front = proj(Prx, Pry, Prz)
                 if not in_front:
                     continue
-                if not _visible(back_depth, back_id, Wc, Hc, sx, sy, depth,
-                                mesh_id, bias_rel, bias_abs):
+                if not visible(back_depth, back_id, sx, sy, depth):
                     continue
                 sample = bsample(sx, sy)
                 use_back = True

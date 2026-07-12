@@ -17,6 +17,7 @@ even at 4096x4096.
 
 from array import array
 from collections import deque
+from itertools import accumulate
 
 from .image import ImageRGBA
 
@@ -28,10 +29,14 @@ def _nearest_painted_map(d, W, H, alpha_threshold):
     n = W * H
     src = array("i", [-1]) * n
     q = deque()
-    for i in range(n):
-        if d[i * 4 + 3] >= alpha_threshold:
+    # scan the alpha channel directly (array slice is C-level) instead of
+    # indexing d[i*4+3] in a Python loop; identical membership.
+    alphas = d[3::4]
+    append = q.append
+    for i, a in enumerate(alphas):
+        if a >= alpha_threshold:
             src[i] = i
-            q.append(i)
+            append(i)
     if not q:
         return None
     while q:
@@ -138,36 +143,38 @@ def _box_blur(values, W, H, radius):
     tmp = array("f", bytes(4 * W * H))
     out = array("f", bytes(4 * W * H))
 
+    # Prefix sums built with itertools.accumulate (C-level) over a contiguous
+    # slice; acc[k] == the old pref[k+1] (same sequential add order), and
+    # pref[a] == acc[a-1] for a>0 else 0.0. The window average keeps the exact
+    # subtract-and-divide, so results are bit-for-bit identical.
+    last_x = W - 1
     for y in range(H):
         base = y * W
-        pref = [0.0] * (W + 1)
-        s = 0.0
-        for x in range(W):
-            s += values[base + x]
-            pref[x + 1] = s
+        acc = list(accumulate(values[base:base + W]))
         for x in range(W):
             a = x - r
             b = x + r
             if a < 0:
                 a = 0
-            if b > W - 1:
-                b = W - 1
-            tmp[base + x] = (pref[b + 1] - pref[a]) / (b - a + 1)
+            if b > last_x:
+                b = last_x
+            hi = acc[b]
+            lo = acc[a - 1] if a > 0 else 0.0
+            tmp[base + x] = (hi - lo) / (b - a + 1)
 
+    last_y = H - 1
     for x in range(W):
-        pref = [0.0] * (H + 1)
-        s = 0.0
-        for y in range(H):
-            s += tmp[y * W + x]
-            pref[y + 1] = s
+        acc = list(accumulate(tmp[x::W]))
         for y in range(H):
             a = y - r
             b = y + r
             if a < 0:
                 a = 0
-            if b > H - 1:
-                b = H - 1
-            out[y * W + x] = (pref[b + 1] - pref[a]) / (b - a + 1)
+            if b > last_y:
+                b = last_y
+            hi = acc[b]
+            lo = acc[a - 1] if a > 0 else 0.0
+            out[y * W + x] = (hi - lo) / (b - a + 1)
     return out
 
 

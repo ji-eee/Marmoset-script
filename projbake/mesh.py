@@ -126,24 +126,45 @@ class SceneMesh:
         uvs = self.uvs
         norms = self.normals
         tris = self.triangles
+        uv_len = len(uvs) if uvs else 0
+        norm_len = len(norms) if norms else 0
+
+        # Vertices are shared by ~6 triangles each, so cache the (deterministic)
+        # world position and world normal per vertex index for this call. The
+        # cached values are bit-identical to recomputing them.
+        transform_point = la.transform_point
+        transform_dir3 = la.transform_dir3
+        v_normalize = la.v_normalize
+        pos_cache = {}
+        norm_cache = {}
+        _MISS = pos_cache  # any unique sentinel object
 
         def wpos(vi):
-            b = vi * 3
-            return la.transform_point(W, (verts[b], verts[b + 1], verts[b + 2]))
+            p = pos_cache.get(vi)
+            if p is None:
+                b = vi * 3
+                p = transform_point(W, (verts[b], verts[b + 1], verts[b + 2]))
+                pos_cache[vi] = p
+            return p
 
         def wuv(vi):
             b = vi * 2
-            if uvs and b + 1 < len(uvs):
+            if uvs and b + 1 < uv_len:
                 return (uvs[b], uvs[b + 1])
             return (0.0, 0.0)
 
         def wnorm(vi):
-            if norms and vi * 3 + 2 < len(norms):
-                b = vi * 3
-                return la.v_normalize(
-                    la.transform_dir3(Nmat, (norms[b], norms[b + 1], norms[b + 2]))
-                )
-            return None
+            n = norm_cache.get(vi, _MISS)
+            if n is _MISS:
+                if norms and vi * 3 + 2 < norm_len:
+                    b = vi * 3
+                    n = v_normalize(
+                        transform_dir3(Nmat, (norms[b], norms[b + 1], norms[b + 2]))
+                    )
+                else:
+                    n = None
+                norm_cache[vi] = n
+            return n
 
         for sm in self.submeshes:
             start = sm.start_index
